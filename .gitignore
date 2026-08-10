@@ -1,0 +1,8 @@
+/target/
+/.embuild/
+/vendor/upstream/
+.DS_Store
+.env.local
+/artifacts/*.png
+/components_*.lock
+/sdkconfig*

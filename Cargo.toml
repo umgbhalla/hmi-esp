@@ -1,0 +1,23 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/hmi-core",
+    "crates/st7305",
+    "crates/hmi-simulator",
+    "crates/hmi-firmware",
+]
+exclude = ["vendor/upstream"]
+
+# Development-only source overrides. These make a future workspace use the
+# exact local checkouts recorded in vendor/sources.lock instead of silently
+# resolving a different crates.io release.
+[patch.crates-io]
+mousefood = { path = "vendor/upstream/ratatui__mousefood/mousefood" }
+embedded-graphics-simulator = { path = "vendor/upstream/embedded-graphics__simulator" }
+esp-idf-hal = { path = "vendor/upstream/esp-rs__esp-idf-hal" }
+esp-idf-svc = { path = "vendor/upstream/esp-rs__esp-idf-svc" }
+
+# Kept patched for evaluation builds. Production firmware must choose either
+# ESP-IDF (the current recommendation) or bare-metal esp-hal; it must not try
+# to combine both runtime models in one binary.
+esp-hal = { path = "vendor/upstream/esp-rs__esp-hal/esp-hal" }

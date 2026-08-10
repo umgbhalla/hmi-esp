@@ -1,0 +1,12 @@
+[package]
+name = "hmi-simulator"
+version = "0.1.0"
+edition = "2021"
+license = "MIT OR Apache-2.0"
+
+[dependencies]
+anyhow = "1.0"
+embedded-graphics = "0.8.1"
+embedded-graphics-simulator = { version = "0.8.0", default-features = false }
+hmi-core = { path = "../hmi-core" }
+

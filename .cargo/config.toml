@@ -1,0 +1,6 @@
+[env]
+ESP_IDF_SYS_ROOT_CRATE = "hmi-firmware"
+
+[target.xtensa-esp32s3-espidf]
+linker = "ldproxy"
+rustflags = ["--cfg", "espidf_time64"]

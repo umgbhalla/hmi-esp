@@ -1,0 +1,4 @@
+interface:
+  display_name: "Codex Luna Swarm"
+  short_description: "Launch and collect independent Luna lanes"
+  default_prompt: "Use $codex-luna-swarm to derive distinct bounded lanes from the repository and proceed to the launch receipt without pausing for approval; wait and collect only when requested."

@@ -1,0 +1,26 @@
+[
+  {
+    "name": "state_machine_ux",
+    "task": "Own the two-button application state machine and human interaction quality in crates/hmi-core/src/lib.rs plus docs/firmware.md. Trace every View and UiAction entry/exit, stale action behavior, back/home semantics, destructive-action safety, and relevant tests. Report evidence-backed defects and smallest fixes."
+  },
+  {
+    "name": "audio_wav_speaker",
+    "task": "Own microphone capture, WAV recorder/header finalization, WAV chunk parser, streaming playback, full-duplex codec configuration, PA/volume, and speaker test from crates/hmi-firmware/src/main.rs through components/hmi_board. Compare exact-board vendored examples only where needed. Report correctness failures, underrun risks, and smallest fixes."
+  },
+  {
+    "name": "portrait_display_te",
+    "task": "Own the native 300x400 framebuffer packing, ST7305 address window, startup clearing, GPIO6 TE synchronization, portrait rendering bounds, static halftone stability, and display/audio scheduling interaction. Start at crates/st7305/src/lib.rs and render_dashboard. Report proven mapping, tearing, clipping, or timing defects."
+  },
+  {
+    "name": "sd_file_integrity",
+    "task": "Own SD file catalog traversal, safe paths, bounded viewer, text/hex paging, opt-in event logging semantics, recording names, I/O failure recovery, and power-off finalization in crates/hmi-firmware/src/main.rs. Construct hostile filesystem and malformed-file cases. Report confirmed integrity/security/reliability defects."
+  },
+  {
+    "name": "embedded_reliability",
+    "task": "Own runtime timing, memory allocation, blocking I/O, main-loop health, Wi-Fi/sensor/audio/display coexistence, error propagation, and boot/power behavior across local non-vendor crates. Identify only concrete production failure modes with exact evidence and smallest corrections."
+  },
+  {
+    "name": "tests_docs_quality",
+    "task": "Own test coverage, dead code, warnings, documentation accuracy, simulator fidelity, and public contracts across local crates, README.md, and docs/firmware.md. Check that claims match implementation and hardware proof boundaries. Report missing high-value tests and confirmed mismatches, prioritized."
+  }
+]

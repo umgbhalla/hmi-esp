@@ -1,0 +1,15 @@
+# name|url|commit|directory|license
+waveshareteam/ESP32-S3-RLCD-4.2|https://github.com/waveshareteam/ESP32-S3-RLCD-4.2.git|eb1f63427d735a22b9c30e22fa63ebddae1834d3|waveshareteam__ESP32-S3-RLCD-4.2|Apache-2.0
+URL42/doom-esp32s3-rlcd|https://github.com/URL42/doom-esp32s3-rlcd.git|4990d7b25c682fb2bb1cf2ec77af5d286698374c|URL42__doom-esp32s3-rlcd|GPL-2.0
+tigerxu255-lgtm/esp32-s3-rlcd-gb-emulator|https://github.com/tigerxu255-lgtm/esp32-s3-rlcd-gb-emulator.git|0ed9478d0b57a17752fbe0f42f161b31c3af720a|tigerxu255-lgtm__esp32-s3-rlcd-gb-emulator|GPL-2.0
+art-jin/esp32-rlcd-apps|https://github.com/art-jin/esp32-rlcd-apps.git|7728fd9c6ce5d922024209d4fc45f8800fb87205|art-jin__esp32-rlcd-apps|Apache-2.0
+Gskdl78/claude-rlcd|https://github.com/Gskdl78/claude-rlcd.git|0a0efffcd828263053f1e43b16f67f214d22eeb0|Gskdl78__claude-rlcd|MIT
+Winter-And-You-Gone/token-monitor-RLCD|https://github.com/Winter-And-You-Gone/token-monitor-RLCD.git|e3703f2b5d45a0dd4c7e3066798a141fedfb645c|Winter-And-You-Gone__token-monitor-RLCD|MIT-declared-no-root-license-file
+bitbank2/OneBitDisplay|https://github.com/bitbank2/OneBitDisplay.git|99694b329db35f2b38bd414f61147797185e4cdd|bitbank2__OneBitDisplay|Apache-2.0
+SixSigmaEngineer/waveshareesp32clock|https://github.com/SixSigmaEngineer/waveshareesp32clock.git|f15f003f9aad6de4747156146324e1cedf38515a|SixSigmaEngineer__waveshareesp32clock|MIT-declared-for-mods-no-root-license-file
+ratatui/mousefood|https://github.com/ratatui/mousefood.git|3f89b16e50e9b77973cfb1042d39ee220395f5b6|ratatui__mousefood|MIT-OR-Apache-2.0
+embedded-graphics/simulator|https://github.com/embedded-graphics/simulator.git|cb6825e4a2460dcc0c7c7600fc27a27ea96645ac|embedded-graphics__simulator|MIT-OR-Apache-2.0
+esp-rs/esp-idf-hal|https://github.com/esp-rs/esp-idf-hal.git|f1bac2d93fe9e92a1df2ad0acd34ef702a791ba4|esp-rs__esp-idf-hal|MIT-OR-Apache-2.0
+esp-rs/esp-idf-svc|https://github.com/esp-rs/esp-idf-svc.git|f59ffada5638cf582fe8cab1771fa38873ef6d73|esp-rs__esp-idf-svc|MIT-OR-Apache-2.0
+esp-rs/esp-hal|https://github.com/esp-rs/esp-hal.git|e1a042e3fa92839b157f72ef60b8db884156d067|esp-rs__esp-hal|MIT-OR-Apache-2.0
+

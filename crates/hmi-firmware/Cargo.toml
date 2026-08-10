@@ -1,0 +1,39 @@
+[package]
+name = "hmi-firmware"
+version = "0.1.0"
+edition = "2021"
+license = "MIT OR Apache-2.0"
+build = "build.rs"
+
+[[bin]]
+name = "hmi-firmware"
+harness = false
+
+[dependencies]
+hmi-core = { path = "../hmi-core" }
+st7305 = { path = "../st7305" }
+
+[target.'cfg(target_os = "espidf")'.dependencies]
+anyhow = "1.0"
+embedded-graphics = "0.8.1"
+embedded-hal = "1.0.0"
+embedded-svc = "0.29"
+esp-idf-hal = { version = "0.46.2", features = ["embedded-graphics"] }
+esp-idf-svc = "0.52.1"
+esp-idf-sys = { version = "0.37.1", features = ["binstart"] }
+log = "0.4"
+
+[build-dependencies]
+embuild = { version = "0.33.3", features = ["espidf"] }
+
+[package.metadata.esp-idf-sys]
+esp_idf_version = "v5.5.3"
+esp_idf_sdkconfig_defaults = ["crates/hmi-firmware/sdkconfig.defaults"]
+
+[[package.metadata.esp-idf-sys.extra_components]]
+component_dirs = [
+    "components",
+    "../../vendor/upstream/waveshareteam__ESP32-S3-RLCD-4.2/02_Example/ESP-IDF/07_Audio_Test/components/ExternLib/codec_board",
+]
+bindings_header = "bindings.h"
+bindings_module = "hmi_board"
