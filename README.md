@@ -11,11 +11,15 @@ remain planned rather than implemented.
 
 ## UI preview
 
-| Home | Audio |
+| Home | Menu |
 | --- | --- |
-| <img src="artifacts/pages/home.png" alt="HMI home screen" width="400"> | <img src="artifacts/pages/audio.png" alt="HMI audio screen" width="400"> |
-| Input | Events |
-| <img src="artifacts/pages/input.png" alt="HMI input screen" width="400"> | <img src="artifacts/pages/events.png" alt="HMI events screen" width="400"> |
+| <img src="artifacts/pages/home.png" alt="HMI home screen" width="400"> | <img src="artifacts/pages/menu.png" alt="HMI menu screen" width="400"> |
+| Recorder | Files |
+| <img src="artifacts/pages/recorder.png" alt="HMI recorder screen" width="400"> | <img src="artifacts/pages/files.png" alt="HMI files screen" width="400"> |
+| Player | Viewer |
+| <img src="artifacts/pages/player.png" alt="HMI player screen" width="400"> | <img src="artifacts/pages/viewer.png" alt="HMI viewer screen" width="400"> |
+| Live | Diagnostics |
+| <img src="artifacts/pages/live.png" alt="HMI live screen" width="400"> | <img src="artifacts/pages/diagnostics.png" alt="HMI diagnostics screen" width="400"> |
 | Settings | |
 | <img src="artifacts/pages/settings.png" alt="HMI settings screen" width="400"> | |
 
