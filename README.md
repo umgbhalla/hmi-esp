@@ -9,6 +9,16 @@ simulator, and an ESP-IDF firmware shell for Wi-Fi, storage, audio, sensors, and
 USB Serial/JTAG. HTTP/WebSocket transport, a versioned remote protocol, and OTA
 remain planned rather than implemented.
 
+## UI preview
+
+| Home | Audio |
+| --- | --- |
+| <img src="artifacts/pages/home.png" alt="HMI home screen" width="400"> | <img src="artifacts/pages/audio.png" alt="HMI audio screen" width="400"> |
+| Input | Events |
+| <img src="artifacts/pages/input.png" alt="HMI input screen" width="400"> | <img src="artifacts/pages/events.png" alt="HMI events screen" width="400"> |
+| Settings | |
+| <img src="artifacts/pages/settings.png" alt="HMI settings screen" width="400"> | |
+
 Start with:
 
 - [`docs/build-intent.md`](docs/build-intent.md) for the product boundary and
