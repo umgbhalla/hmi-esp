@@ -903,6 +903,7 @@ name = "hmi-touch349-firmware"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "embedded-graphics",
  "embuild",
  "esp-idf-sys",
 ]

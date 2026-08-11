@@ -2,6 +2,7 @@
 
 #include <string.h>
 
+#include "driver/gpio.h"
 #include "driver/i2c_master.h"
 #include "driver/ledc.h"
 #include "driver/sdmmc_host.h"
@@ -13,6 +14,7 @@
 #include "esp_lcd_panel_io.h"
 #include "esp_lcd_panel_ops.h"
 #include "esp_log.h"
+#include "esp_sleep.h"
 #include "esp_timer.h"
 #include "esp_vfs_fat.h"
 #include "freertos/FreeRTOS.h"
@@ -28,6 +30,7 @@
 #define LCD_D2 GPIO_NUM_13
 #define LCD_D3 GPIO_NUM_14
 #define LCD_BACKLIGHT GPIO_NUM_42
+#define POWER_BUTTON GPIO_NUM_16
 
 #define SYSTEM_I2C_SDA GPIO_NUM_47
 #define SYSTEM_I2C_SCL GPIO_NUM_48
@@ -141,6 +144,17 @@ static esp_err_t init_backlight(void) {
     return ledc_channel_config(&channel);
 }
 
+static esp_err_t init_power_button(void) {
+    const gpio_config_t config = {
+        .pin_bit_mask = 1ULL << POWER_BUTTON,
+        .mode = GPIO_MODE_INPUT,
+        .pull_up_en = GPIO_PULLUP_ENABLE,
+        .pull_down_en = GPIO_PULLDOWN_DISABLE,
+        .intr_type = GPIO_INTR_DISABLE,
+    };
+    return gpio_config(&config);
+}
+
 static esp_err_t reset_panel(void) {
     ESP_RETURN_ON_ERROR(
         esp_io_expander_set_level(expander, EXIO_LCD_RESET, 1),
@@ -222,6 +236,7 @@ int hmi_touch349_init(void) {
     }
     ESP_RETURN_ON_ERROR(init_expander(), TAG, "expander");
     ESP_RETURN_ON_ERROR(init_backlight(), TAG, "backlight PWM");
+    ESP_RETURN_ON_ERROR(init_power_button(), TAG, "power button");
 
     transfer_done = xSemaphoreCreateBinary();
     ESP_RETURN_ON_FALSE(transfer_done != NULL, ESP_ERR_NO_MEM, TAG, "transfer semaphore");
@@ -380,4 +395,37 @@ int hmi_touch349_sd_mount(hmi_touch349_sd_stats_t *stats) {
         sd_card->csd.sector_size
     );
     return ESP_OK;
+}
+
+bool hmi_touch349_power_button_pressed(void) {
+    // Waveshare's PWR input on GPIO16 is active-low.
+    return gpio_get_level(POWER_BUTTON) == 0;
+}
+
+void hmi_touch349_power_off(void) {
+    ESP_LOGW(TAG, "POWER OFF requested: display off, backlight off, SYS_EN low");
+    if (panel != NULL) {
+        const esp_err_t display_error = esp_lcd_panel_disp_on_off(panel, false);
+        if (display_error != ESP_OK) {
+            ESP_LOGW(TAG, "display-off command failed: %s", esp_err_to_name(display_error));
+        }
+    }
+    const esp_err_t backlight_error = hmi_touch349_backlight_set(255, false);
+    if (backlight_error != ESP_OK) {
+        ESP_LOGW(TAG, "backlight-off failed: %s", esp_err_to_name(backlight_error));
+    }
+    vTaskDelay(pdMS_TO_TICKS(60));
+    if (expander != NULL) {
+        const esp_err_t latch_error =
+            esp_io_expander_set_level(expander, EXIO_SYSTEM_ENABLE, 0);
+        if (latch_error != ESP_OK) {
+            ESP_LOGE(TAG, "SYS_EN release failed: %s", esp_err_to_name(latch_error));
+        }
+    }
+
+    // Battery power should disappear when SYS_EN is released. USB can continue
+    // powering the MCU, so deep sleep guarantees that the firmware stays off
+    // instead of re-lighting the panel or continuing background work.
+    vTaskDelay(pdMS_TO_TICKS(120));
+    esp_deep_sleep_start();
 }
