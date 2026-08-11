@@ -23,3 +23,7 @@ uint16_t *hmi_touch349_framebuffer(size_t *pixel_count);
 int hmi_touch349_flush_full(hmi_touch349_flush_stats_t *stats);
 int hmi_touch349_backlight_set(uint8_t duty, bool enabled);
 int hmi_touch349_touch_read(uint16_t *x, uint16_t *y, bool *pressed);
+int hmi_touch349_time_init(const char *timezone);
+int hmi_touch349_time_read(int32_t *year, uint8_t *month, uint8_t *day,
+                           uint8_t *weekday, uint8_t *hour, uint8_t *minute,
+                           uint8_t *second);

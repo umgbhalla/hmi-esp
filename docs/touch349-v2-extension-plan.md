@@ -159,7 +159,7 @@ Gate: RLCD tests and screenshots are unchanged. A physical RLCD smoke test remai
 - Add the separate V2 firmware package and SDK defaults.
 - Vendor pinned AXS15231B and TCA9554 components.
 - Implement system I2C, expander, GPIO42 PWM, reset order, QSPI, PSRAM frame, and ten-band blocking flush.
-- Render black, white, checkerboard, RGB bars, 1-pixel border, and corner markers.
+- Render the dashboard as the first frame while the backlight remains disabled.
 - Log frame size, band count, flush duration, DMA wait, free internal heap, and free PSRAM.
 
 Gate: visible full-screen pattern on the physical V2 panel with correct colors/orientation and no missing bands. A serial `flush complete` message alone does not pass.

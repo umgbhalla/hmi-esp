@@ -7,9 +7,8 @@ use embedded_graphics::{
 };
 use embedded_graphics_simulator::{OutputSettingsBuilder, SimulatorDisplay};
 use hmi_core::{
-    render_dashboard, render_touch349_dashboard, render_touch349_test_pattern, BatteryTelemetry,
-    ClockTelemetry, DashboardState, EnvironmentTelemetry, FileEntry, FileKind, Health,
-    StorageTelemetry, View,
+    render_dashboard, render_touch349_dashboard, BatteryTelemetry, ClockTelemetry, DashboardState,
+    EnvironmentTelemetry, FileEntry, FileKind, Health, StorageTelemetry, View,
 };
 
 fn main() -> anyhow::Result<()> {
@@ -43,13 +42,8 @@ fn main() -> anyhow::Result<()> {
     match board.as_str() {
         "touch349-v2" => {
             let mut display = SimulatorDisplay::<Rgb565>::new(Size::new(172, 640));
-            if requested_page == "test-pattern" {
-                render_touch349_test_pattern(&mut display)
-                    .expect("infallible Touch349 test pattern");
-            } else {
-                render_touch349_dashboard(&mut display, &state)
-                    .expect("infallible Touch349 simulator target");
-            }
+            render_touch349_dashboard(&mut display, &state)
+                .expect("infallible Touch349 simulator target");
             display
                 .to_rgb_output_image(&settings)
                 .save_png(&output)

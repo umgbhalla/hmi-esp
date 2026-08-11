@@ -1,6 +1,8 @@
 #include "hmi_touch349.h"
 
 #include <string.h>
+#include <stdlib.h>
+#include <time.h>
 
 #include "driver/gpio.h"
 #include "driver/i2c_master.h"
@@ -13,6 +15,7 @@
 #include "esp_lcd_panel_io.h"
 #include "esp_lcd_panel_ops.h"
 #include "esp_log.h"
+#include "esp_sntp.h"
 #include "esp_timer.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/semphr.h"
@@ -47,11 +50,7 @@ static uint16_t *framebuffer;
 static uint16_t *dma_band;
 static uint16_t flush_failures;
 static bool initialized;
-
-static const axs15231b_lcd_init_cmd_t lcd_init_commands[] = {
-    {0x11, NULL, 0, 100},
-    {0x29, NULL, 0, 100},
-};
+static bool time_started;
 
 static bool transfer_complete(
     esp_lcd_panel_io_handle_t panel_io,
@@ -201,8 +200,10 @@ static esp_err_t init_panel(void) {
     );
 
     axs15231b_vendor_config_t vendor_config = {
-        .init_cmds = lcd_init_commands,
-        .init_cmds_size = sizeof(lcd_init_commands) / sizeof(lcd_init_commands[0]),
+        // The short Waveshare {SLPOUT, DISPON} sequence leaves some AXS15231B
+        // revisions displaying noise. NULL selects the component's full table.
+        .init_cmds = NULL,
+        .init_cmds_size = 0,
         .flags.use_qspi_interface = 1,
     };
     esp_lcd_panel_dev_config_t panel_config = {
@@ -337,5 +338,48 @@ int hmi_touch349_touch_read(uint16_t *x, uint16_t *y, bool *pressed) {
     raw_y = raw_y > HMI_TOUCH349_WIDTH ? HMI_TOUCH349_WIDTH : raw_y;
     *x = raw_y == HMI_TOUCH349_WIDTH ? HMI_TOUCH349_WIDTH - 1 : raw_y;
     *y = raw_x == 0 ? HMI_TOUCH349_HEIGHT - 1 : HMI_TOUCH349_HEIGHT - raw_x;
+    return ESP_OK;
+}
+
+int hmi_touch349_time_init(const char *timezone) {
+    if (timezone == NULL) {
+        return ESP_ERR_INVALID_ARG;
+    }
+    if (setenv("TZ", timezone, 1) != 0) {
+        return ESP_FAIL;
+    }
+    tzset();
+    if (!time_started) {
+        esp_sntp_setoperatingmode(ESP_SNTP_OPMODE_POLL);
+        esp_sntp_setservername(0, "pool.ntp.org");
+        esp_sntp_init();
+        time_started = true;
+    }
+    return ESP_OK;
+}
+
+int hmi_touch349_time_read(int32_t *year, uint8_t *month, uint8_t *day,
+                           uint8_t *weekday, uint8_t *hour, uint8_t *minute,
+                           uint8_t *second) {
+    if (year == NULL || month == NULL || day == NULL || weekday == NULL ||
+        hour == NULL || minute == NULL || second == NULL) {
+        return ESP_ERR_INVALID_ARG;
+    }
+    time_t now;
+    time(&now);
+    if (now < 1700000000) {
+        return ESP_ERR_INVALID_STATE;
+    }
+    struct tm local;
+    if (localtime_r(&now, &local) == NULL) {
+        return ESP_FAIL;
+    }
+    *year = local.tm_year + 1900;
+    *month = local.tm_mon + 1;
+    *day = local.tm_mday;
+    *weekday = local.tm_wday;
+    *hour = local.tm_hour;
+    *minute = local.tm_min;
+    *second = local.tm_sec;
     return ESP_OK;
 }

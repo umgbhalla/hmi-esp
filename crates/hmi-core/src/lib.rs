@@ -10,7 +10,7 @@ use embedded_graphics::{
         ascii::{FONT_10X20, FONT_6X10, FONT_9X15_BOLD},
         MonoTextStyle,
     },
-    pixelcolor::{BinaryColor, Rgb565, RgbColor},
+    pixelcolor::{BinaryColor, Rgb565},
     prelude::*,
     primitives::{Line, PrimitiveStyle, Rectangle},
     text::{Baseline, Text},
@@ -359,6 +359,8 @@ pub struct DashboardState {
     pub buttons: [ButtonTelemetry; 2],
     pub settings_index: u8,
     pub speaker_volume: u8,
+    pub display_brightness: u8,
+    pub display_fps: u8,
     pub event_logging_enabled: bool,
     pub recording: bool,
     pub recording_name: String,
@@ -401,6 +403,8 @@ impl Default for DashboardState {
             buttons: [ButtonTelemetry::default(); 2],
             settings_index: 0,
             speaker_volume: 55,
+            display_brightness: 75,
+            display_fps: 4,
             event_logging_enabled: false,
             recording: false,
             recording_name: String::new(),
@@ -436,6 +440,87 @@ impl DashboardState {
 
     pub fn selected_file(&self) -> Option<&FileEntry> {
         self.files.get(self.file_index)
+    }
+
+    /// Apply one released Touch349 tap in native portrait coordinates.
+    /// Returns true when the backlight setting changed and must be applied by firmware.
+    pub fn apply_touch349(&mut self, x: u16, y: u16, now_ms: u64) -> bool {
+        let mut brightness_changed = false;
+        if y >= 568 {
+            if x < 86 {
+                self.view = View::Home;
+            } else {
+                self.view = match self.view {
+                    View::Home | View::Menu => View::Home,
+                    View::Player | View::Viewer => View::Files,
+                    _ => View::Menu,
+                };
+            }
+        } else {
+            match self.view {
+                View::Home if y >= 214 => {
+                    let column = usize::from(x >= 86);
+                    let row = usize::from(y >= 352);
+                    self.menu_index = (row * 2 + column) as u8;
+                    self.view = match self.menu_index {
+                        0 => View::Recorder,
+                        1 => View::Files,
+                        2 => View::Live,
+                        _ => View::Settings,
+                    };
+                }
+                View::Menu if (68..508).contains(&y) => {
+                    self.menu_index = ((y - 68) / 88).min(4) as u8;
+                    self.view = match self.menu_index {
+                        0 => View::Recorder,
+                        1 => View::Files,
+                        2 => View::Live,
+                        3 => View::Diagnostics,
+                        _ => View::Settings,
+                    };
+                }
+                View::Settings if (72..456).contains(&y) => match (y - 72) / 96 {
+                    0 => {
+                        self.display_brightness = match self.display_brightness {
+                            0..=25 => 50,
+                            26..=50 => 75,
+                            51..=75 => 100,
+                            _ => 25,
+                        };
+                        brightness_changed = true;
+                    }
+                    1 => {
+                        self.display_fps = match self.display_fps {
+                            0..=2 => 4,
+                            3..=4 => 8,
+                            _ => 2,
+                        };
+                    }
+                    2 => self.pending_action = Some(UiAction::RefreshDisplay),
+                    _ => {
+                        self.events.clear();
+                        self.event_offset = 0;
+                    }
+                },
+                View::Recorder if y >= 448 => self.pending_action = Some(UiAction::ToggleRecording),
+                View::Files => {
+                    if self.files.is_empty() {
+                        self.pending_action = Some(UiAction::RefreshFiles);
+                    } else if (68..500).contains(&y) {
+                        let start = self.file_index.saturating_sub(3);
+                        self.file_index = (start + usize::from((y - 68) / 72))
+                            .min(self.files.len().saturating_sub(1));
+                        self.pending_action = Some(UiAction::OpenSelectedFile);
+                    }
+                }
+                View::Player if y >= 448 => self.pending_action = Some(UiAction::TogglePlayback),
+                View::Live if y >= 500 => self.view = View::Recorder,
+                View::Viewer if y >= 130 => self.pending_action = Some(UiAction::ViewerNext),
+                _ => {}
+            }
+        }
+        self.record(now_ms, "TOUCH", format!("x={x} y={y}"));
+        brightness_changed
     }
 
     pub fn record(&mut self, at_ms: u64, source: &'static str, detail: impl Into<String>) -> u64 {
@@ -1545,39 +1630,6 @@ where
     touch_nav(display, state.view)
 }
 
-pub fn render_touch349_test_pattern<D>(display: &mut D) -> Result<(), D::Error>
-where
-    D: DrawTarget<Color = Rgb565> + OriginDimensions,
-{
-    let bars = [
-        Rgb565::RED,
-        Rgb565::GREEN,
-        Rgb565::BLUE,
-        Rgb565::CYAN,
-        Rgb565::MAGENTA,
-        Rgb565::YELLOW,
-        Rgb565::WHITE,
-        Rgb565::BLACK,
-    ];
-    for (index, color) in bars.into_iter().enumerate() {
-        Rectangle::new(
-            Point::new(0, index as i32 * 80),
-            Size::new(TOUCH349_WIDTH, 80),
-        )
-        .into_styled(PrimitiveStyle::with_fill(color))
-        .draw(display)?;
-    }
-    Rectangle::new(Point::zero(), Size::new(TOUCH349_WIDTH, TOUCH349_HEIGHT))
-        .into_styled(PrimitiveStyle::with_stroke(Rgb565::WHITE, 1))
-        .draw(display)?;
-    Line::new(Point::new(0, 0), Point::new(171, 639))
-        .into_styled(PrimitiveStyle::with_stroke(Rgb565::WHITE, 1))
-        .draw(display)?;
-    Line::new(Point::new(171, 0), Point::new(0, 639))
-        .into_styled(PrimitiveStyle::with_stroke(Rgb565::BLACK, 1))
-        .draw(display)
-}
-
 fn touch_header<D: DrawTarget<Color = Rgb565>>(
     display: &mut D,
     state: &DashboardState,
@@ -1631,58 +1683,40 @@ fn touch_home<D: DrawTarget<Color = Rgb565>>(
         TOUCH_MUTED,
         false,
     )?;
-    touch_card(display, 8, 148, 156, 82, "NETWORK", state.wifi.health)?;
+    touch_card(display, 8, 148, 156, 54, "NETWORK", state.wifi.health)?;
     touch_text(
         display,
         if state.wifi.ipv4.is_empty() {
-            "CONNECTING"
+            "CONNECTING..."
         } else {
             state.wifi.ipv4.as_str()
         },
-        18,
-        190,
+        66,
+        169,
         TOUCH_TEXT,
         false,
     )?;
-    touch_card(display, 8, 240, 156, 82, "AUDIO", state.audio.health)?;
+    touch_text(display, "QUICK ACTIONS", 8, 224, TOUCH_MUTED, false)?;
+    for (x, y, label, color) in [
+        (8, 252, "RECORD", TOUCH_ERROR),
+        (88, 252, "FILES", TOUCH_ACCENT),
+        (8, 368, "LIVE", TOUCH_OK),
+        (88, 368, "SETTINGS", TOUCH_WARN),
+    ] {
+        Rectangle::new(Point::new(x, y), Size::new(76, 100))
+            .into_styled(PrimitiveStyle::with_fill(TOUCH_SURFACE))
+            .draw(display)?;
+        Rectangle::new(Point::new(x, y), Size::new(76, 5))
+            .into_styled(PrimitiveStyle::with_fill(color))
+            .draw(display)?;
+        touch_text(display, label, x + 8, y + 42, TOUCH_TEXT, false)?;
+        touch_text(display, "TAP", x + 8, y + 68, TOUCH_MUTED, false)?;
+    }
     touch_text(
         display,
-        &format!("RMS {:>5}  PEAK {:>5}", state.audio.rms, state.audio.peak),
-        18,
-        282,
-        TOUCH_TEXT,
-        false,
-    )?;
-    touch_card(display, 8, 332, 156, 82, "STORAGE", state.storage.health)?;
-    touch_text(
-        display,
-        if state.storage.mounted {
-            "SD READY"
-        } else {
-            "NO SD CARD"
-        },
-        18,
-        374,
-        TOUCH_TEXT,
-        false,
-    )?;
-    touch_card(display, 8, 424, 156, 92, "SYSTEM", Health::Ok)?;
-    touch_text(
-        display,
-        &format!("HEAP {}K", state.runtime.free_heap / 1024),
-        18,
-        466,
-        TOUCH_TEXT,
-        false,
-    )?;
-    touch_text(
-        display,
-        &format!(
-            "LCD {}ms  LOOP {}Hz",
-            state.runtime.display_flush_ms, state.runtime.loop_hz
-        ),
-        18,
-        486,
+        "Tap an action to open",
+        20,
+        500,
         TOUCH_MUTED,
         false,
     )
@@ -1703,7 +1737,8 @@ fn touch_menu<D: DrawTarget<Color = Rgb565>>(
                 TOUCH_SURFACE
             }))
             .draw(display)?;
-        touch_text(display, label, 20, y + 24, TOUCH_TEXT, true)?;
+        touch_text(display, label, 20, y + 18, TOUCH_TEXT, true)?;
+        touch_text(display, "TAP TO OPEN", 20, y + 44, TOUCH_MUTED, false)?;
         touch_text(display, ">", 145, y + 25, TOUCH_TEXT, false)?;
     }
     Ok(())
@@ -1968,46 +2003,44 @@ fn touch_settings<D: DrawTarget<Color = Rgb565>>(
     display: &mut D,
     state: &DashboardState,
 ) -> Result<(), D::Error> {
-    let labels = [
-        "REFRESH DISPLAY",
-        "SPEAKER VOLUME",
-        "TEST SPEAKER",
-        "EVENT LOG",
-        "RESCAN SD",
-        "PREPARE POWER OFF",
+    let values = [
+        ("BRIGHTNESS", format!("{}%", state.display_brightness)),
+        ("REFRESH RATE", format!("{} FPS", state.display_fps)),
+        ("REDRAW SCREEN", "TAP TO RUN".into()),
+        ("CLEAR NOTICES", "TAP TO RUN".into()),
     ];
-    for (index, label) in labels.iter().enumerate() {
-        let y = 66 + index as i32 * 74;
-        let selected = state.settings_index as usize == index;
-        Rectangle::new(Point::new(8, y), Size::new(156, 62))
-            .into_styled(PrimitiveStyle::with_fill(if selected {
-                TOUCH_ACCENT
-            } else {
-                TOUCH_SURFACE
-            }))
+    for (index, (label, value)) in values.iter().enumerate() {
+        let y = 72 + index as i32 * 96;
+        Rectangle::new(Point::new(8, y), Size::new(156, 80))
+            .into_styled(PrimitiveStyle::with_fill(TOUCH_SURFACE))
             .draw(display)?;
-        touch_text(display, label, 15, y + 22, TOUCH_TEXT, false)?;
+        touch_text(display, label, 16, y + 14, TOUCH_MUTED, false)?;
+        touch_text(display, value, 16, y + 40, TOUCH_TEXT, true)?;
+        touch_text(display, ">", 146, y + 42, TOUCH_MUTED, false)?;
     }
-    Ok(())
+    touch_text(
+        display,
+        "Tap a row to change it",
+        17,
+        486,
+        TOUCH_MUTED,
+        false,
+    )
 }
 
 fn touch_nav<D: DrawTarget<Color = Rgb565>>(display: &mut D, view: View) -> Result<(), D::Error> {
     Rectangle::new(Point::new(0, 568), Size::new(172, 72))
         .into_styled(PrimitiveStyle::with_fill(TOUCH_SURFACE))
         .draw(display)?;
-    for (x, icon, active) in [
-        (4, "HOME", view == View::Home),
-        (59, "MENU", view == View::Menu),
-        (114, "BACK", false),
-    ] {
-        Rectangle::new(Point::new(x, 578), Size::new(52, 48))
+    for (x, label, active) in [(4, "HOME", view == View::Home), (88, "BACK", false)] {
+        Rectangle::new(Point::new(x, 576), Size::new(80, 56))
             .into_styled(PrimitiveStyle::with_fill(if active {
                 TOUCH_ACCENT
             } else {
                 TOUCH_SURFACE_ALT
             }))
             .draw(display)?;
-        touch_text(display, icon, x + 10, 597, TOUCH_TEXT, false)?;
+        touch_text(display, label, x + 20, 597, TOUCH_TEXT, true)?;
     }
     Ok(())
 }
@@ -2168,6 +2201,31 @@ mod tests {
             decode_touch349_packet(&packet),
             Some(Touch349Point { x: 171, y: 0 })
         );
+    }
+
+    #[test]
+    fn touch349_home_tiles_and_navigation_are_direct() {
+        let mut state = DashboardState::default();
+        state.apply_touch349(120, 270, 10);
+        assert_eq!(state.view, View::Files);
+        state.apply_touch349(120, 610, 20);
+        assert_eq!(state.view, View::Menu);
+        state.apply_touch349(30, 610, 25);
+        assert_eq!(state.view, View::Home);
+        state.apply_touch349(30, 390, 30);
+        assert_eq!(state.view, View::Live);
+    }
+
+    #[test]
+    fn touch349_settings_rows_change_visible_values() {
+        let mut state = DashboardState {
+            view: View::Settings,
+            ..DashboardState::default()
+        };
+        assert!(state.apply_touch349(40, 100, 10));
+        assert_eq!(state.display_brightness, 100);
+        assert!(!state.apply_touch349(40, 190, 20));
+        assert_eq!(state.display_fps, 8);
     }
 
     #[test]
