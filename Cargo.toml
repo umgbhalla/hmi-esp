@@ -5,6 +5,7 @@ members = [
     "crates/st7305",
     "crates/hmi-simulator",
     "crates/hmi-firmware",
+    "crates/hmi-touch349-firmware",
 ]
 exclude = ["vendor/upstream"]
 

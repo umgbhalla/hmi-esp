@@ -1,4 +1,5 @@
 # name|url|commit|directory|license
+waveshareteam/ESP32-S3-Touch-LCD-3.49-V2|https://github.com/waveshareteam/ESP32-S3-Touch-LCD-3.49-V2.git|1c157e6e8e68b89fd4dc400f46bf1724cb64a57e|waveshareteam__ESP32-S3-Touch-LCD-3.49-V2|Apache-2.0
 waveshareteam/ESP32-S3-RLCD-4.2|https://github.com/waveshareteam/ESP32-S3-RLCD-4.2.git|eb1f63427d735a22b9c30e22fa63ebddae1834d3|waveshareteam__ESP32-S3-RLCD-4.2|Apache-2.0
 URL42/doom-esp32s3-rlcd|https://github.com/URL42/doom-esp32s3-rlcd.git|4990d7b25c682fb2bb1cf2ec77af5d286698374c|URL42__doom-esp32s3-rlcd|GPL-2.0
 tigerxu255-lgtm/esp32-s3-rlcd-gb-emulator|https://github.com/tigerxu255-lgtm/esp32-s3-rlcd-gb-emulator.git|0ed9478d0b57a17752fbe0f42f161b31c3af720a|tigerxu255-lgtm__esp32-s3-rlcd-gb-emulator|GPL-2.0
@@ -12,4 +13,3 @@ embedded-graphics/simulator|https://github.com/embedded-graphics/simulator.git|c
 esp-rs/esp-idf-hal|https://github.com/esp-rs/esp-idf-hal.git|f1bac2d93fe9e92a1df2ad0acd34ef702a791ba4|esp-rs__esp-idf-hal|MIT-OR-Apache-2.0
 esp-rs/esp-idf-svc|https://github.com/esp-rs/esp-idf-svc.git|f59ffada5638cf582fe8cab1771fa38873ef6d73|esp-rs__esp-idf-svc|MIT-OR-Apache-2.0
 esp-rs/esp-hal|https://github.com/esp-rs/esp-hal.git|e1a042e3fa92839b157f72ef60b8db884156d067|esp-rs__esp-hal|MIT-OR-Apache-2.0
-

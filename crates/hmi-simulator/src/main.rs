@@ -1,19 +1,19 @@
 use std::{env, fs, path::PathBuf};
 
 use anyhow::Context;
-use embedded_graphics::{geometry::Size, pixelcolor::BinaryColor};
+use embedded_graphics::{
+    geometry::Size,
+    pixelcolor::{BinaryColor, Rgb565},
+};
 use embedded_graphics_simulator::{OutputSettingsBuilder, SimulatorDisplay};
 use hmi_core::{
-    render_dashboard, BatteryTelemetry, ClockTelemetry, DashboardState, EnvironmentTelemetry,
-    FileEntry, FileKind, Health, StorageTelemetry, View,
+    render_dashboard, render_touch349_dashboard, render_touch349_test_pattern, BatteryTelemetry,
+    ClockTelemetry, DashboardState, EnvironmentTelemetry, FileEntry, FileKind, Health,
+    StorageTelemetry, View,
 };
 
 fn main() -> anyhow::Result<()> {
-    let output = env::args_os()
-        .nth(1)
-        .map(PathBuf::from)
-        .unwrap_or_else(|| PathBuf::from("artifacts/dashboard.png"));
-    let requested_page = env::args().nth(2).unwrap_or_else(|| "home".into());
+    let (output, requested_page, board) = arguments();
     if let Some(parent) = output.parent() {
         fs::create_dir_all(parent).with_context(|| format!("create {}", parent.display()))?;
     }
@@ -36,19 +36,74 @@ fn main() -> anyhow::Result<()> {
     state.record(830, "SD", "event recorder mounted");
     state.record(1_020, "MIC", "capture ring running");
 
-    let mut display = SimulatorDisplay::<BinaryColor>::new(Size::new(300, 400));
-    render_dashboard(&mut display, &state).expect("infallible simulator target");
     let settings = OutputSettingsBuilder::new()
         .scale(2)
         .pixel_spacing(0)
         .build();
-    display
-        .to_rgb_output_image(&settings)
-        .save_png(&output)
-        .with_context(|| format!("write {}", output.display()))?;
+    match board.as_str() {
+        "touch349-v2" => {
+            let mut display = SimulatorDisplay::<Rgb565>::new(Size::new(172, 640));
+            if requested_page == "test-pattern" {
+                render_touch349_test_pattern(&mut display)
+                    .expect("infallible Touch349 test pattern");
+            } else {
+                render_touch349_dashboard(&mut display, &state)
+                    .expect("infallible Touch349 simulator target");
+            }
+            display
+                .to_rgb_output_image(&settings)
+                .save_png(&output)
+                .with_context(|| format!("write {}", output.display()))?;
+        }
+        _ => {
+            let mut display = SimulatorDisplay::<BinaryColor>::new(Size::new(300, 400));
+            render_dashboard(&mut display, &state).expect("infallible RLCD simulator target");
+            display
+                .to_rgb_output_image(&settings)
+                .save_png(&output)
+                .with_context(|| format!("write {}", output.display()))?;
+        }
+    }
 
     println!("rendered {}", output.display());
     Ok(())
+}
+
+fn arguments() -> (PathBuf, String, String) {
+    let mut output = None;
+    let mut page = None;
+    let mut board = String::from("rlcd42");
+    let mut positional = Vec::new();
+    let mut args = env::args_os().skip(1);
+    while let Some(argument) = args.next() {
+        match argument.to_string_lossy().as_ref() {
+            "--output" => output = args.next().map(PathBuf::from),
+            "--page" => {
+                page = args
+                    .next()
+                    .map(|value| value.to_string_lossy().into_owned())
+            }
+            "--board" => {
+                if let Some(value) = args.next() {
+                    board = value.to_string_lossy().into_owned();
+                }
+            }
+            _ => positional.push(argument),
+        }
+    }
+    if output.is_none() {
+        output = positional.first().map(PathBuf::from);
+    }
+    if page.is_none() {
+        page = positional
+            .get(1)
+            .map(|value| value.to_string_lossy().into_owned());
+    }
+    (
+        output.unwrap_or_else(|| PathBuf::from("artifacts/dashboard.png")),
+        page.unwrap_or_else(|| "home".into()),
+        board,
+    )
 }
 
 fn fixture() -> DashboardState {

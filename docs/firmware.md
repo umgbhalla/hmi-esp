@@ -1,11 +1,13 @@
 # Local device firmware
 
-This first firmware is a local diagnostic interface for the exact Waveshare
-ESP32-S3-RLCD-4.2. It is deliberately useful before any Mac bridge exists: the
-device samples its own hardware, retains a bounded RAM event history, and
-renders all status locally. Persistent event logging and WAV recording are
-disabled until the user explicitly enables them; live microphone levels remain
-visible without saving PCM.
+The primary firmware is a local diagnostic interface for the exact Waveshare
+ESP32-S3-RLCD-4.2. A separate bring-up firmware targets the
+ESP32-S3-Touch-LCD-3.49 V2; both consume the same Rust dashboard state while
+keeping their incompatible panel drivers and pin maps isolated. The device is
+useful before any Mac bridge exists: it samples its own hardware, retains a
+bounded RAM event history, and renders status locally. Persistent event logging
+and WAV recording are disabled until explicitly enabled; live microphone levels
+remain visible without saving PCM.
 
 ## Controls
 
@@ -102,9 +104,19 @@ checked into Git. Use `.env.local.example` as the shape for another network.
 ```sh
 cargo +esp test --workspace --exclude hmi-firmware
 cargo +esp run -p hmi-simulator -- artifacts/portrait-home.png home
+cargo run -p hmi-simulator -- \
+  --board touch349-v2 \
+  --page home \
+  --output artifacts/touch349-v2/home.png
 ./scripts/build-firmware.sh
+./scripts/build-touch349-firmware.sh
 ```
 
-The last command produces the ESP32-S3 release ELF at
-`target/xtensa-esp32s3-espidf/release/hmi-firmware`. It builds only. Flashing is
-a separate, explicitly authorized operation.
+The build commands produce independent ESP32-S3 release ELFs:
+
+- `target/xtensa-esp32s3-espidf/release/hmi-firmware`
+- `target/xtensa-esp32s3-espidf/release/hmi-touch349-firmware`
+
+They build only; flashing is a separate, explicitly authorized operation. The
+Touch349 image uses the exact V2 AXS15231B/TCA9554 pin contract and must not be
+flashed to a V1 board.

@@ -1,0 +1,36 @@
+[package]
+name = "hmi-touch349-firmware"
+version = "0.1.0"
+edition = "2021"
+license = "MIT OR Apache-2.0"
+build = "build.rs"
+
+[[bin]]
+name = "hmi-touch349-firmware"
+harness = false
+
+[dependencies]
+hmi-core = { path = "../hmi-core" }
+
+[target.'cfg(target_os = "espidf")'.dependencies]
+anyhow = "1.0"
+embedded-svc = "0.29"
+esp-idf-hal = "0.46.2"
+esp-idf-svc = "0.52.1"
+esp-idf-sys = { version = "0.37.1", features = ["binstart"] }
+log = "0.4"
+
+[build-dependencies]
+embuild = { version = "0.33.3", features = ["espidf"] }
+
+[package.metadata.esp-idf-sys]
+esp_idf_version = "v5.5.3"
+esp_idf_sdkconfig_defaults = ["crates/hmi-touch349-firmware/sdkconfig.defaults"]
+
+[[package.metadata.esp-idf-sys.extra_components]]
+component_dirs = [
+    "components",
+    "../../vendor/components/touch349-v2",
+]
+bindings_header = "bindings.h"
+bindings_module = "hmi_touch349"

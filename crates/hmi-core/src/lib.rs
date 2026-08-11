@@ -10,7 +10,7 @@ use embedded_graphics::{
         ascii::{FONT_10X20, FONT_6X10, FONT_9X15_BOLD},
         MonoTextStyle,
     },
-    pixelcolor::BinaryColor,
+    pixelcolor::{BinaryColor, Rgb565, RgbColor},
     prelude::*,
     primitives::{Line, PrimitiveStyle, Rectangle},
     text::{Baseline, Text},
@@ -1439,9 +1439,736 @@ fn month_name(month: u8) -> &'static str {
     .unwrap_or("---")
 }
 
+pub const TOUCH349_WIDTH: u32 = 172;
+pub const TOUCH349_HEIGHT: u32 = 640;
+pub const TOUCH349_PIXELS: usize = TOUCH349_WIDTH as usize * TOUCH349_HEIGHT as usize;
+pub const TOUCH349_FRAME_BYTES: usize = TOUCH349_PIXELS * 2;
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct Touch349Point {
+    pub x: u16,
+    pub y: u16,
+}
+
+pub fn decode_touch349_packet(response: &[u8]) -> Option<Touch349Point> {
+    if response.len() < 6 || !(1..5).contains(&response[1]) {
+        return None;
+    }
+    let raw_x = ((u16::from(response[2]) & 0x0f) << 8) | u16::from(response[3]);
+    let raw_y = ((u16::from(response[4]) & 0x0f) << 8) | u16::from(response[5]);
+    Some(Touch349Point {
+        x: raw_y.min(TOUCH349_WIDTH as u16 - 1),
+        y: TOUCH349_HEIGHT as u16 - 1 - raw_x.min(TOUCH349_HEIGHT as u16 - 1),
+    })
+}
+
+pub struct Touch349FrameBuffer<'a> {
+    pixels: &'a mut [u16],
+}
+
+impl<'a> Touch349FrameBuffer<'a> {
+    pub fn new(pixels: &'a mut [u16]) -> Option<Self> {
+        (pixels.len() == TOUCH349_PIXELS).then_some(Self { pixels })
+    }
+
+    pub fn pixels(&self) -> &[u16] {
+        self.pixels
+    }
+}
+
+impl OriginDimensions for Touch349FrameBuffer<'_> {
+    fn size(&self) -> Size {
+        Size::new(TOUCH349_WIDTH, TOUCH349_HEIGHT)
+    }
+}
+
+impl DrawTarget for Touch349FrameBuffer<'_> {
+    type Color = Rgb565;
+    type Error = core::convert::Infallible;
+
+    fn draw_iter<I>(&mut self, pixels: I) -> Result<(), Self::Error>
+    where
+        I: IntoIterator<Item = Pixel<Self::Color>>,
+    {
+        for Pixel(point, color) in pixels {
+            if point.x >= 0
+                && point.y >= 0
+                && point.x < TOUCH349_WIDTH as i32
+                && point.y < TOUCH349_HEIGHT as i32
+            {
+                let index = point.y as usize * TOUCH349_WIDTH as usize + point.x as usize;
+                self.pixels[index] = color.into_storage();
+            }
+        }
+        Ok(())
+    }
+
+    fn clear(&mut self, color: Self::Color) -> Result<(), Self::Error> {
+        self.pixels.fill(color.into_storage());
+        Ok(())
+    }
+}
+
+const TOUCH_BG: Rgb565 = Rgb565::new(1, 3, 5);
+const TOUCH_SURFACE: Rgb565 = Rgb565::new(3, 8, 12);
+const TOUCH_SURFACE_ALT: Rgb565 = Rgb565::new(5, 13, 19);
+const TOUCH_TEXT: Rgb565 = Rgb565::new(29, 59, 29);
+const TOUCH_MUTED: Rgb565 = Rgb565::new(15, 34, 20);
+const TOUCH_ACCENT: Rgb565 = Rgb565::new(2, 49, 29);
+const TOUCH_OK: Rgb565 = Rgb565::new(7, 51, 18);
+const TOUCH_WARN: Rgb565 = Rgb565::new(31, 39, 4);
+const TOUCH_ERROR: Rgb565 = Rgb565::new(31, 12, 9);
+
+/// Render the Touch LCD 3.49 V2 in its native 172x640 portrait orientation.
+///
+/// This is deliberately a separate layout from the 300x400 RLCD renderer:
+/// the two targets share state, but not geometry or color assumptions.
+pub fn render_touch349_dashboard<D>(display: &mut D, state: &DashboardState) -> Result<(), D::Error>
+where
+    D: DrawTarget<Color = Rgb565> + OriginDimensions,
+{
+    display.clear(TOUCH_BG)?;
+    touch_header(display, state)?;
+
+    match state.view {
+        View::Home => touch_home(display, state)?,
+        View::Menu => touch_menu(display, state)?,
+        View::Recorder => touch_recorder(display, state)?,
+        View::Files => touch_files(display, state)?,
+        View::Player => touch_player(display, state)?,
+        View::Viewer => touch_viewer(display, state)?,
+        View::Live => touch_live(display, state)?,
+        View::Diagnostics => touch_diagnostics(display, state)?,
+        View::Settings => touch_settings(display, state)?,
+    }
+
+    touch_nav(display, state.view)
+}
+
+pub fn render_touch349_test_pattern<D>(display: &mut D) -> Result<(), D::Error>
+where
+    D: DrawTarget<Color = Rgb565> + OriginDimensions,
+{
+    let bars = [
+        Rgb565::RED,
+        Rgb565::GREEN,
+        Rgb565::BLUE,
+        Rgb565::CYAN,
+        Rgb565::MAGENTA,
+        Rgb565::YELLOW,
+        Rgb565::WHITE,
+        Rgb565::BLACK,
+    ];
+    for (index, color) in bars.into_iter().enumerate() {
+        Rectangle::new(
+            Point::new(0, index as i32 * 80),
+            Size::new(TOUCH349_WIDTH, 80),
+        )
+        .into_styled(PrimitiveStyle::with_fill(color))
+        .draw(display)?;
+    }
+    Rectangle::new(Point::zero(), Size::new(TOUCH349_WIDTH, TOUCH349_HEIGHT))
+        .into_styled(PrimitiveStyle::with_stroke(Rgb565::WHITE, 1))
+        .draw(display)?;
+    Line::new(Point::new(0, 0), Point::new(171, 639))
+        .into_styled(PrimitiveStyle::with_stroke(Rgb565::WHITE, 1))
+        .draw(display)?;
+    Line::new(Point::new(171, 0), Point::new(0, 639))
+        .into_styled(PrimitiveStyle::with_stroke(Rgb565::BLACK, 1))
+        .draw(display)
+}
+
+fn touch_header<D: DrawTarget<Color = Rgb565>>(
+    display: &mut D,
+    state: &DashboardState,
+) -> Result<(), D::Error> {
+    Rectangle::new(Point::zero(), Size::new(TOUCH349_WIDTH, 52))
+        .into_styled(PrimitiveStyle::with_fill(TOUCH_SURFACE))
+        .draw(display)?;
+    touch_text(display, "ZONKO HMI", 8, 8, TOUCH_ACCENT, true)?;
+    touch_text(display, state.view.title(), 8, 28, TOUCH_TEXT, false)?;
+    let network = match state.wifi.health {
+        Health::Ok => TOUCH_OK,
+        Health::Error => TOUCH_ERROR,
+        _ => TOUCH_WARN,
+    };
+    Rectangle::new(Point::new(151, 12), Size::new(10, 10))
+        .into_styled(PrimitiveStyle::with_fill(network))
+        .draw(display)?;
+    Rectangle::new(Point::new(148, 31), Size::new(14, 7))
+        .into_styled(PrimitiveStyle::with_stroke(TOUCH_MUTED, 1))
+        .draw(display)?;
+    let battery_width = (12u32 * state.battery.percent.min(100) as u32 / 100).max(1);
+    Rectangle::new(Point::new(149, 32), Size::new(battery_width, 5))
+        .into_styled(PrimitiveStyle::with_fill(if state.battery.percent < 20 {
+            TOUCH_ERROR
+        } else {
+            TOUCH_OK
+        }))
+        .draw(display)
+}
+
+fn touch_home<D: DrawTarget<Color = Rgb565>>(
+    display: &mut D,
+    state: &DashboardState,
+) -> Result<(), D::Error> {
+    let time = if state.clock.health == Health::Ok {
+        format!("{:02}:{:02}", state.clock.hour, state.clock.minute)
+    } else {
+        "--:--".into()
+    };
+    touch_text(display, &time, 14, 74, TOUCH_TEXT, true)?;
+    touch_text(
+        display,
+        &format!(
+            "{} {:02} {}",
+            weekday_name(state.clock.weekday),
+            state.clock.day,
+            month_name(state.clock.month)
+        ),
+        17,
+        112,
+        TOUCH_MUTED,
+        false,
+    )?;
+    touch_card(display, 8, 148, 156, 82, "NETWORK", state.wifi.health)?;
+    touch_text(
+        display,
+        if state.wifi.ipv4.is_empty() {
+            "CONNECTING"
+        } else {
+            state.wifi.ipv4.as_str()
+        },
+        18,
+        190,
+        TOUCH_TEXT,
+        false,
+    )?;
+    touch_card(display, 8, 240, 156, 82, "AUDIO", state.audio.health)?;
+    touch_text(
+        display,
+        &format!("RMS {:>5}  PEAK {:>5}", state.audio.rms, state.audio.peak),
+        18,
+        282,
+        TOUCH_TEXT,
+        false,
+    )?;
+    touch_card(display, 8, 332, 156, 82, "STORAGE", state.storage.health)?;
+    touch_text(
+        display,
+        if state.storage.mounted {
+            "SD READY"
+        } else {
+            "NO SD CARD"
+        },
+        18,
+        374,
+        TOUCH_TEXT,
+        false,
+    )?;
+    touch_card(display, 8, 424, 156, 92, "SYSTEM", Health::Ok)?;
+    touch_text(
+        display,
+        &format!("HEAP {}K", state.runtime.free_heap / 1024),
+        18,
+        466,
+        TOUCH_TEXT,
+        false,
+    )?;
+    touch_text(
+        display,
+        &format!(
+            "LCD {}ms  LOOP {}Hz",
+            state.runtime.display_flush_ms, state.runtime.loop_hz
+        ),
+        18,
+        486,
+        TOUCH_MUTED,
+        false,
+    )
+}
+
+fn touch_menu<D: DrawTarget<Color = Rgb565>>(
+    display: &mut D,
+    state: &DashboardState,
+) -> Result<(), D::Error> {
+    let labels = ["RECORD", "FILES", "LIVE AUDIO", "DIAGNOSTICS", "SETTINGS"];
+    for (index, label) in labels.iter().enumerate() {
+        let y = 70 + index as i32 * 88;
+        let selected = state.menu_index as usize == index;
+        Rectangle::new(Point::new(8, y), Size::new(156, 72))
+            .into_styled(PrimitiveStyle::with_fill(if selected {
+                TOUCH_ACCENT
+            } else {
+                TOUCH_SURFACE
+            }))
+            .draw(display)?;
+        touch_text(display, label, 20, y + 24, TOUCH_TEXT, true)?;
+        touch_text(display, ">", 145, y + 25, TOUCH_TEXT, false)?;
+    }
+    Ok(())
+}
+
+fn touch_recorder<D: DrawTarget<Color = Rgb565>>(
+    display: &mut D,
+    state: &DashboardState,
+) -> Result<(), D::Error> {
+    touch_status_pill(
+        display,
+        8,
+        70,
+        if state.recording {
+            "RECORDING"
+        } else {
+            "READY"
+        },
+        if state.recording {
+            TOUCH_ERROR
+        } else {
+            TOUCH_OK
+        },
+    )?;
+    touch_waveform(display, &state.audio, 8, 124, 156, 220, TOUCH_ACCENT)?;
+    touch_text(
+        display,
+        "24 kHz / stereo / WAV",
+        13,
+        360,
+        TOUCH_MUTED,
+        false,
+    )?;
+    touch_text(
+        display,
+        &format!("{} KiB", state.recording_bytes / 1024),
+        13,
+        388,
+        TOUCH_TEXT,
+        true,
+    )?;
+    touch_action(
+        display,
+        8,
+        448,
+        if state.recording {
+            "STOP"
+        } else {
+            "START RECORDING"
+        },
+        TOUCH_ERROR,
+    )
+}
+
+fn touch_files<D: DrawTarget<Color = Rgb565>>(
+    display: &mut D,
+    state: &DashboardState,
+) -> Result<(), D::Error> {
+    if state.files.is_empty() {
+        touch_text(display, "NO FILES", 48, 260, TOUCH_MUTED, true)?;
+        return touch_action(display, 8, 448, "RESCAN SD", TOUCH_ACCENT);
+    }
+    let start = state.file_index.saturating_sub(3);
+    for (row, entry) in state.files.iter().skip(start).take(6).enumerate() {
+        let index = start + row;
+        let y = 68 + row as i32 * 72;
+        let selected = index == state.file_index;
+        Rectangle::new(Point::new(8, y), Size::new(156, 60))
+            .into_styled(PrimitiveStyle::with_fill(if selected {
+                TOUCH_ACCENT
+            } else {
+                TOUCH_SURFACE
+            }))
+            .draw(display)?;
+        touch_text(
+            display,
+            &clipped_name(&entry.name, 18),
+            16,
+            y + 12,
+            TOUCH_TEXT,
+            false,
+        )?;
+        touch_text(
+            display,
+            &format!("{} KiB", entry.size / 1024),
+            16,
+            y + 34,
+            TOUCH_MUTED,
+            false,
+        )?;
+    }
+    Ok(())
+}
+
+fn touch_player<D: DrawTarget<Color = Rgb565>>(
+    display: &mut D,
+    state: &DashboardState,
+) -> Result<(), D::Error> {
+    touch_status_pill(
+        display,
+        8,
+        70,
+        if state.playing { "PLAYING" } else { "PAUSED" },
+        if state.playing { TOUCH_OK } else { TOUCH_WARN },
+    )?;
+    touch_text(
+        display,
+        &clipped_name(&state.playback_name, 20),
+        10,
+        118,
+        TOUCH_TEXT,
+        true,
+    )?;
+    touch_waveform(
+        display,
+        &state.playback_audio,
+        8,
+        160,
+        156,
+        190,
+        TOUCH_ACCENT,
+    )?;
+    let progress = if state.playback_duration_ms == 0 {
+        0
+    } else {
+        (148u64 * state.playback_position_ms / state.playback_duration_ms).min(148) as u32
+    };
+    Rectangle::new(Point::new(12, 374), Size::new(148, 10))
+        .into_styled(PrimitiveStyle::with_fill(TOUCH_SURFACE_ALT))
+        .draw(display)?;
+    Rectangle::new(Point::new(12, 374), Size::new(progress, 10))
+        .into_styled(PrimitiveStyle::with_fill(TOUCH_ACCENT))
+        .draw(display)?;
+    touch_text(
+        display,
+        &format!("VOLUME {}%", state.speaker_volume),
+        12,
+        406,
+        TOUCH_MUTED,
+        false,
+    )?;
+    touch_action(
+        display,
+        8,
+        458,
+        if state.playing { "PAUSE" } else { "PLAY" },
+        TOUCH_ACCENT,
+    )
+}
+
+fn touch_viewer<D: DrawTarget<Color = Rgb565>>(
+    display: &mut D,
+    state: &DashboardState,
+) -> Result<(), D::Error> {
+    touch_text(
+        display,
+        &clipped_name(&state.viewer_name, 20),
+        10,
+        72,
+        TOUCH_TEXT,
+        true,
+    )?;
+    touch_text(
+        display,
+        &format!("{} B  @{}", state.viewer_size, state.viewer_offset),
+        10,
+        98,
+        TOUCH_MUTED,
+        false,
+    )?;
+    Rectangle::new(Point::new(8, 130), Size::new(156, 390))
+        .into_styled(PrimitiveStyle::with_fill(TOUCH_SURFACE))
+        .draw(display)?;
+    for (index, row) in state.viewer_preview.lines().take(18).enumerate() {
+        touch_text(
+            display,
+            &clipped_name(row, 23),
+            13,
+            140 + index as i32 * 20,
+            TOUCH_TEXT,
+            false,
+        )?;
+    }
+    Ok(())
+}
+
+fn touch_live<D: DrawTarget<Color = Rgb565>>(
+    display: &mut D,
+    state: &DashboardState,
+) -> Result<(), D::Error> {
+    touch_waveform(display, &state.audio, 8, 72, 156, 330, TOUCH_ACCENT)?;
+    touch_text(
+        display,
+        &format!("RMS {}", state.audio.rms),
+        12,
+        426,
+        TOUCH_TEXT,
+        true,
+    )?;
+    touch_text(
+        display,
+        &format!("PEAK {}", state.audio.peak),
+        12,
+        458,
+        TOUCH_MUTED,
+        false,
+    )?;
+    touch_action(display, 8, 508, "OPEN RECORDER", TOUCH_ERROR)
+}
+
+fn touch_diagnostics<D: DrawTarget<Color = Rgb565>>(
+    display: &mut D,
+    state: &DashboardState,
+) -> Result<(), D::Error> {
+    for (index, (label, health)) in [
+        ("NETWORK", state.wifi.health),
+        ("AUDIO", state.audio.health),
+        ("STORAGE", state.storage.health),
+        ("BATTERY", state.battery.health),
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        touch_card(display, 8, 68 + index as i32 * 72, 156, 60, label, health)?;
+    }
+    touch_text(
+        display,
+        &format!("HEAP {}K", state.runtime.free_heap / 1024),
+        12,
+        374,
+        TOUCH_TEXT,
+        false,
+    )?;
+    touch_text(
+        display,
+        &format!("PSRAM {}K", state.runtime.free_psram / 1024),
+        12,
+        398,
+        TOUCH_TEXT,
+        false,
+    )?;
+    touch_text(
+        display,
+        &format!("LOOP {}Hz", state.runtime.loop_hz),
+        12,
+        422,
+        TOUCH_TEXT,
+        false,
+    )?;
+    touch_text(
+        display,
+        &format!("LCD {}ms", state.runtime.display_flush_ms),
+        12,
+        446,
+        TOUCH_TEXT,
+        false,
+    )?;
+    Ok(())
+}
+
+fn touch_settings<D: DrawTarget<Color = Rgb565>>(
+    display: &mut D,
+    state: &DashboardState,
+) -> Result<(), D::Error> {
+    let labels = [
+        "REFRESH DISPLAY",
+        "SPEAKER VOLUME",
+        "TEST SPEAKER",
+        "EVENT LOG",
+        "RESCAN SD",
+        "PREPARE POWER OFF",
+    ];
+    for (index, label) in labels.iter().enumerate() {
+        let y = 66 + index as i32 * 74;
+        let selected = state.settings_index as usize == index;
+        Rectangle::new(Point::new(8, y), Size::new(156, 62))
+            .into_styled(PrimitiveStyle::with_fill(if selected {
+                TOUCH_ACCENT
+            } else {
+                TOUCH_SURFACE
+            }))
+            .draw(display)?;
+        touch_text(display, label, 15, y + 22, TOUCH_TEXT, false)?;
+    }
+    Ok(())
+}
+
+fn touch_nav<D: DrawTarget<Color = Rgb565>>(display: &mut D, view: View) -> Result<(), D::Error> {
+    Rectangle::new(Point::new(0, 568), Size::new(172, 72))
+        .into_styled(PrimitiveStyle::with_fill(TOUCH_SURFACE))
+        .draw(display)?;
+    for (x, icon, active) in [
+        (4, "HOME", view == View::Home),
+        (59, "MENU", view == View::Menu),
+        (114, "BACK", false),
+    ] {
+        Rectangle::new(Point::new(x, 578), Size::new(52, 48))
+            .into_styled(PrimitiveStyle::with_fill(if active {
+                TOUCH_ACCENT
+            } else {
+                TOUCH_SURFACE_ALT
+            }))
+            .draw(display)?;
+        touch_text(display, icon, x + 10, 597, TOUCH_TEXT, false)?;
+    }
+    Ok(())
+}
+
+fn touch_card<D: DrawTarget<Color = Rgb565>>(
+    display: &mut D,
+    x: i32,
+    y: i32,
+    width: u32,
+    height: u32,
+    label: &str,
+    health: Health,
+) -> Result<(), D::Error> {
+    Rectangle::new(Point::new(x, y), Size::new(width, height))
+        .into_styled(PrimitiveStyle::with_fill(TOUCH_SURFACE))
+        .draw(display)?;
+    touch_text(display, label, x + 10, y + 12, TOUCH_MUTED, false)?;
+    let color = match health {
+        Health::Ok => TOUCH_OK,
+        Health::Error => TOUCH_ERROR,
+        _ => TOUCH_WARN,
+    };
+    Rectangle::new(Point::new(x + width as i32 - 18, y + 15), Size::new(7, 7))
+        .into_styled(PrimitiveStyle::with_fill(color))
+        .draw(display)
+}
+
+fn touch_status_pill<D: DrawTarget<Color = Rgb565>>(
+    display: &mut D,
+    x: i32,
+    y: i32,
+    label: &str,
+    color: Rgb565,
+) -> Result<(), D::Error> {
+    Rectangle::new(Point::new(x, y), Size::new(156, 38))
+        .into_styled(PrimitiveStyle::with_fill(color))
+        .draw(display)?;
+    touch_text(display, label, x + 12, y + 12, TOUCH_TEXT, false)
+}
+
+fn touch_action<D: DrawTarget<Color = Rgb565>>(
+    display: &mut D,
+    x: i32,
+    y: i32,
+    label: &str,
+    color: Rgb565,
+) -> Result<(), D::Error> {
+    Rectangle::new(Point::new(x, y), Size::new(156, 56))
+        .into_styled(PrimitiveStyle::with_fill(color))
+        .draw(display)?;
+    touch_text(display, label, x + 14, y + 21, TOUCH_TEXT, true)
+}
+
+fn touch_waveform<D: DrawTarget<Color = Rgb565>>(
+    display: &mut D,
+    audio: &AudioTelemetry,
+    x: i32,
+    y: i32,
+    width: u32,
+    height: u32,
+    color: Rgb565,
+) -> Result<(), D::Error> {
+    Rectangle::new(Point::new(x, y), Size::new(width, height))
+        .into_styled(PrimitiveStyle::with_fill(TOUCH_SURFACE))
+        .draw(display)?;
+    let center = y + height as i32 / 2;
+    let scale = audio.history_peak().max(256) as u32;
+    let mut previous = None;
+    for index in 0..audio.history_len as usize {
+        if let Some(sample) = audio.history_sample(index) {
+            let px =
+                x + 5 + index as i32 * (width as i32 - 10) / (AUDIO_HISTORY_CAPACITY as i32 - 1);
+            let amplitude =
+                ((sample as u32 * (height - 12) / 2) / scale).min((height - 12) / 2) as i32;
+            let point = Point::new(
+                px,
+                if index % 2 == 0 {
+                    center - amplitude
+                } else {
+                    center + amplitude
+                },
+            );
+            if let Some(last) = previous {
+                Line::new(last, point)
+                    .into_styled(PrimitiveStyle::with_stroke(color, 2))
+                    .draw(display)?;
+            }
+            previous = Some(point);
+        }
+    }
+    Ok(())
+}
+
+fn touch_text<D: DrawTarget<Color = Rgb565>>(
+    display: &mut D,
+    text: &str,
+    x: i32,
+    y: i32,
+    color: Rgb565,
+    bold: bool,
+) -> Result<(), D::Error> {
+    let regular = MonoTextStyle::new(&FONT_6X10, color);
+    let strong = MonoTextStyle::new(&FONT_9X15_BOLD, color);
+    Text::with_baseline(
+        text,
+        Point::new(x, y),
+        if bold { strong } else { regular },
+        Baseline::Top,
+    )
+    .draw(display)
+    .map(|_| ())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn touch349_framebuffer_has_exact_geometry_and_rgb565_storage() {
+        let mut pixels = [0u16; TOUCH349_PIXELS];
+        let mut frame = Touch349FrameBuffer::new(&mut pixels).unwrap();
+        Pixel(Point::new(171, 639), Rgb565::RED)
+            .draw(&mut frame)
+            .unwrap();
+        assert_eq!(frame.size(), Size::new(172, 640));
+        assert_eq!(
+            frame.pixels()[TOUCH349_PIXELS - 1],
+            Rgb565::RED.into_storage()
+        );
+        assert_eq!(TOUCH349_FRAME_BYTES, 220_160);
+    }
+
+    #[test]
+    fn touch349_framebuffer_rejects_wrong_length() {
+        let mut pixels = [0u16; 16];
+        assert!(Touch349FrameBuffer::new(&mut pixels).is_none());
+    }
+
+    #[test]
+    fn touch349_packet_decodes_portrait_coordinates_and_release() {
+        let mut packet = [0u8; 32];
+        assert_eq!(decode_touch349_packet(&packet), None);
+        packet[1] = 1;
+        packet[2] = 0x01;
+        packet[3] = 0x00;
+        packet[4] = 0x00;
+        packet[5] = 0x56;
+        assert_eq!(
+            decode_touch349_packet(&packet),
+            Some(Touch349Point { x: 86, y: 383 })
+        );
+    }
+
+    #[test]
+    fn touch349_packet_clamps_to_visible_edges() {
+        let packet = [0, 1, 0x0f, 0xff, 0x0f, 0xff];
+        assert_eq!(
+            decode_touch349_packet(&packet),
+            Some(Touch349Point { x: 171, y: 0 })
+        );
+    }
 
     #[test]
     fn click_is_emitted_after_debounced_release() {
