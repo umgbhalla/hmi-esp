@@ -28,5 +28,6 @@ uint16_t *hmi_touch349_framebuffer(size_t *pixel_count);
 int hmi_touch349_flush_full(hmi_touch349_flush_stats_t *stats);
 int hmi_touch349_backlight_set(uint8_t duty, bool enabled);
 int hmi_touch349_sd_mount(hmi_touch349_sd_stats_t *stats);
+int hmi_touch349_touch_read(uint8_t response[32]);
 bool hmi_touch349_power_button_pressed(void);
 void hmi_touch349_power_off(void);

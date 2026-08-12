@@ -906,6 +906,7 @@ dependencies = [
  "embedded-graphics",
  "embuild",
  "esp-idf-sys",
+ "hmi-core",
 ]
 
 [[package]]

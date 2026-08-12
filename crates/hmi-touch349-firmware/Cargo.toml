@@ -13,6 +13,7 @@ harness = false
 anyhow = "1.0"
 embedded-graphics = { version = "0.8.1", default-features = false }
 esp-idf-sys = { version = "0.37.1", features = ["binstart"] }
+hmi-core = { path = "../hmi-core" }
 
 [build-dependencies]
 embuild = { version = "0.33.3", features = ["espidf"] }

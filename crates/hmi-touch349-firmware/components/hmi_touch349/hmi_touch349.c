@@ -35,6 +35,10 @@
 #define SYSTEM_I2C_SDA GPIO_NUM_47
 #define SYSTEM_I2C_SCL GPIO_NUM_48
 
+#define TOUCH_I2C_SDA GPIO_NUM_17
+#define TOUCH_I2C_SCL GPIO_NUM_18
+#define TOUCH_I2C_ADDRESS 0x3B
+
 #define SDMMC_CMD GPIO_NUM_39
 #define SDMMC_D0 GPIO_NUM_40
 #define SDMMC_CLK GPIO_NUM_41
@@ -51,6 +55,7 @@ static SemaphoreHandle_t transfer_done;
 static uint16_t *framebuffer;
 static uint16_t *dma_band;
 static sdmmc_card_t *sd_card;
+static i2c_master_dev_handle_t touch_device;
 static bool initialized;
 
 // Exact external initialization sequence used by the pinned Waveshare V2
@@ -142,6 +147,25 @@ static esp_err_t init_backlight(void) {
         .hpoint = 0,
     };
     return ledc_channel_config(&channel);
+}
+
+static esp_err_t init_touch(void) {
+    i2c_master_bus_config_t bus_config = {
+        .i2c_port = I2C_NUM_1,
+        .sda_io_num = TOUCH_I2C_SDA,
+        .scl_io_num = TOUCH_I2C_SCL,
+        .clk_source = I2C_CLK_SRC_DEFAULT,
+        .glitch_ignore_cnt = 7,
+        .flags.enable_internal_pullup = true,
+    };
+    i2c_master_bus_handle_t bus = NULL;
+    ESP_RETURN_ON_ERROR(i2c_new_master_bus(&bus_config, &bus), TAG, "touch I2C");
+    const i2c_device_config_t device_config = {
+        .dev_addr_length = I2C_ADDR_BIT_LEN_7,
+        .device_address = TOUCH_I2C_ADDRESS,
+        .scl_speed_hz = 300000,
+    };
+    return i2c_master_bus_add_device(bus, &device_config, &touch_device);
 }
 
 static esp_err_t init_power_button(void) {
@@ -236,6 +260,7 @@ int hmi_touch349_init(void) {
     }
     ESP_RETURN_ON_ERROR(init_expander(), TAG, "expander");
     ESP_RETURN_ON_ERROR(init_backlight(), TAG, "backlight PWM");
+    ESP_RETURN_ON_ERROR(init_touch(), TAG, "touch controller");
     ESP_RETURN_ON_ERROR(init_power_button(), TAG, "power button");
 
     transfer_done = xSemaphoreCreateBinary();
@@ -400,6 +425,24 @@ int hmi_touch349_sd_mount(hmi_touch349_sd_stats_t *stats) {
 bool hmi_touch349_power_button_pressed(void) {
     // Waveshare's PWR input on GPIO16 is active-low.
     return gpio_get_level(POWER_BUTTON) == 0;
+}
+
+int hmi_touch349_touch_read(uint8_t response[32]) {
+    if (!initialized || touch_device == NULL || response == NULL) {
+        return ESP_ERR_INVALID_STATE;
+    }
+    static const uint8_t command[11] = {
+        0xB5, 0xAB, 0xA5, 0x5A, 0x00, 0x00, 0x00, 0x0E, 0x00, 0x00, 0x00,
+    };
+    memset(response, 0, 32);
+    return i2c_master_transmit_receive(
+        touch_device,
+        command,
+        sizeof(command),
+        response,
+        32,
+        pdMS_TO_TICKS(100)
+    );
 }
 
 void hmi_touch349_power_off(void) {
