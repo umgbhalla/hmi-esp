@@ -404,7 +404,7 @@ impl Default for DashboardState {
             settings_index: 0,
             speaker_volume: 55,
             display_brightness: 75,
-            display_fps: 4,
+            display_fps: 0,
             event_logging_enabled: false,
             recording: false,
             recording_name: String::new(),
@@ -482,20 +482,14 @@ impl DashboardState {
                 View::Settings if (72..456).contains(&y) => match (y - 72) / 96 {
                     0 => {
                         self.display_brightness = match self.display_brightness {
-                            0..=25 => 50,
-                            26..=50 => 75,
-                            51..=75 => 100,
-                            _ => 25,
+                            0..=20 => 50,
+                            21..=50 => 80,
+                            51..=80 => 100,
+                            _ => 20,
                         };
                         brightness_changed = true;
                     }
-                    1 => {
-                        self.display_fps = match self.display_fps {
-                            0..=2 => 4,
-                            3..=4 => 8,
-                            _ => 2,
-                        };
-                    }
+                    1 => self.pending_action = Some(UiAction::RefreshDisplay),
                     2 => self.pending_action = Some(UiAction::RefreshDisplay),
                     _ => {
                         self.events.clear();
@@ -2005,7 +1999,7 @@ fn touch_settings<D: DrawTarget<Color = Rgb565>>(
 ) -> Result<(), D::Error> {
     let values = [
         ("BRIGHTNESS", format!("{}%", state.display_brightness)),
-        ("REFRESH RATE", format!("{} FPS", state.display_fps)),
+        ("REFRESH MODE", "MAX / ON DEMAND".into()),
         ("REDRAW SCREEN", "TAP TO RUN".into()),
         ("CLEAR NOTICES", "TAP TO RUN".into()),
     ];
@@ -2225,7 +2219,8 @@ mod tests {
         assert!(state.apply_touch349(40, 100, 10));
         assert_eq!(state.display_brightness, 100);
         assert!(!state.apply_touch349(40, 190, 20));
-        assert_eq!(state.display_fps, 8);
+        assert_eq!(state.display_fps, 0);
+        assert_eq!(state.take_action(), Some(UiAction::RefreshDisplay));
     }
 
     #[test]

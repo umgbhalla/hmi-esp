@@ -7,6 +7,9 @@
 #include "driver/ledc.h"
 #include "driver/sdmmc_host.h"
 #include "driver/spi_master.h"
+#include "esp_adc/adc_cali.h"
+#include "esp_adc/adc_cali_scheme.h"
+#include "esp_adc/adc_oneshot.h"
 #include "esp_check.h"
 #include "esp_heap_caps.h"
 #include "esp_io_expander_tca9554.h"
@@ -14,7 +17,13 @@
 #include "esp_lcd_panel_io.h"
 #include "esp_lcd_panel_ops.h"
 #include "esp_log.h"
+#include "esp_netif.h"
+#include "esp_netif_sntp.h"
 #include "esp_sleep.h"
+#include "esp_wifi.h"
+#include "esp_event.h"
+#include "esp_heap_caps.h"
+#include "nvs_flash.h"
 #include "esp_timer.h"
 #include "esp_vfs_fat.h"
 #include "freertos/FreeRTOS.h"
@@ -53,9 +62,15 @@ static esp_lcd_panel_handle_t panel;
 static esp_io_expander_handle_t expander;
 static SemaphoreHandle_t transfer_done;
 static uint16_t *framebuffer;
-static uint16_t *dma_band;
+static uint16_t *dma_bands[2];
 static sdmmc_card_t *sd_card;
 static i2c_master_dev_handle_t touch_device;
+static adc_oneshot_unit_handle_t battery_adc;
+static adc_cali_handle_t battery_calibration;
+static bool battery_calibrated;
+static volatile bool wifi_connected;
+static bool sntp_started;
+static uint32_t station_ipv4;
 static bool initialized;
 
 // Exact external initialization sequence used by the pinned Waveshare V2
@@ -168,6 +183,60 @@ static esp_err_t init_touch(void) {
     return i2c_master_bus_add_device(bus, &device_config, &touch_device);
 }
 
+static esp_err_t init_battery_adc(void) {
+    const adc_oneshot_unit_init_cfg_t unit_config = {.unit_id = ADC_UNIT_1};
+    ESP_RETURN_ON_ERROR(adc_oneshot_new_unit(&unit_config, &battery_adc), TAG, "battery ADC unit");
+    const adc_oneshot_chan_cfg_t channel_config = {
+        .atten = ADC_ATTEN_DB_12,
+        .bitwidth = ADC_BITWIDTH_12,
+    };
+    ESP_RETURN_ON_ERROR(
+        adc_oneshot_config_channel(battery_adc, ADC_CHANNEL_3, &channel_config),
+        TAG,
+        "battery ADC channel"
+    );
+    const adc_cali_curve_fitting_config_t calibration_config = {
+        .unit_id = ADC_UNIT_1,
+        .chan = ADC_CHANNEL_3,
+        .atten = ADC_ATTEN_DB_12,
+        .bitwidth = ADC_BITWIDTH_12,
+    };
+    battery_calibrated = adc_cali_create_scheme_curve_fitting(
+        &calibration_config,
+        &battery_calibration
+    ) == ESP_OK;
+    return ESP_OK;
+}
+
+static void network_event_handler(
+    void *argument,
+    esp_event_base_t event_base,
+    int32_t event_id,
+    void *event_data
+) {
+    (void)argument;
+    if (event_base == WIFI_EVENT && event_id == WIFI_EVENT_STA_START) {
+        esp_wifi_connect();
+    } else if (event_base == WIFI_EVENT && event_id == WIFI_EVENT_STA_DISCONNECTED) {
+        const wifi_event_sta_disconnected_t *event = event_data;
+        wifi_connected = false;
+        station_ipv4 = 0;
+        ESP_LOGW(TAG, "WIFI DISCONNECTED reason=%u rssi=%d", event->reason, event->rssi);
+        esp_wifi_connect();
+    } else if (event_base == IP_EVENT && event_id == IP_EVENT_STA_GOT_IP) {
+        const ip_event_got_ip_t *event = event_data;
+        station_ipv4 = event->ip_info.ip.addr;
+        wifi_connected = true;
+        ESP_LOGI(TAG, "WIFI READY ip=" IPSTR, IP2STR(&event->ip_info.ip));
+        if (!sntp_started) {
+            const esp_sntp_config_t sntp_config = ESP_NETIF_SNTP_DEFAULT_CONFIG("pool.ntp.org");
+            if (esp_netif_sntp_init(&sntp_config) == ESP_OK) {
+                sntp_started = true;
+            }
+        }
+    }
+}
+
 static esp_err_t init_power_button(void) {
     const gpio_config_t config = {
         .pin_bit_mask = 1ULL << POWER_BUTTON,
@@ -261,20 +330,25 @@ int hmi_touch349_init(void) {
     ESP_RETURN_ON_ERROR(init_expander(), TAG, "expander");
     ESP_RETURN_ON_ERROR(init_backlight(), TAG, "backlight PWM");
     ESP_RETURN_ON_ERROR(init_touch(), TAG, "touch controller");
+    ESP_RETURN_ON_ERROR(init_battery_adc(), TAG, "battery ADC");
     ESP_RETURN_ON_ERROR(init_power_button(), TAG, "power button");
 
-    transfer_done = xSemaphoreCreateBinary();
+    transfer_done = xSemaphoreCreateCounting(2, 0);
     ESP_RETURN_ON_FALSE(transfer_done != NULL, ESP_ERR_NO_MEM, TAG, "transfer semaphore");
     framebuffer = heap_caps_malloc(
         HMI_TOUCH349_FRAME_BYTES,
         MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT
     );
-    dma_band = heap_caps_malloc(
+    dma_bands[0] = heap_caps_malloc(
+        HMI_TOUCH349_BAND_PIXELS * sizeof(uint16_t),
+        MALLOC_CAP_DMA | MALLOC_CAP_INTERNAL
+    );
+    dma_bands[1] = heap_caps_malloc(
         HMI_TOUCH349_BAND_PIXELS * sizeof(uint16_t),
         MALLOC_CAP_DMA | MALLOC_CAP_INTERNAL
     );
     ESP_RETURN_ON_FALSE(
-        framebuffer != NULL && dma_band != NULL,
+        framebuffer != NULL && dma_bands[0] != NULL && dma_bands[1] != NULL,
         ESP_ERR_NO_MEM,
         TAG,
         "frame buffers"
@@ -296,7 +370,8 @@ uint16_t *hmi_touch349_framebuffer(size_t *pixel_count) {
 
 int hmi_touch349_flush_full(hmi_touch349_flush_stats_t *stats) {
     ESP_RETURN_ON_FALSE(
-        initialized && framebuffer != NULL && dma_band != NULL && panel != NULL,
+        initialized && framebuffer != NULL && dma_bands[0] != NULL &&
+            dma_bands[1] != NULL && panel != NULL,
         ESP_ERR_INVALID_STATE,
         TAG,
         "display not initialized"
@@ -304,18 +379,25 @@ int hmi_touch349_flush_full(hmi_touch349_flush_stats_t *stats) {
 
     const int64_t started = esp_timer_get_time();
     uint32_t wait_us = 0;
-    xSemaphoreGive(transfer_done);
+    while (xSemaphoreTake(transfer_done, 0) == pdTRUE) {
+        // Discard any completion token left by an earlier transfer.
+    }
     for (uint16_t band = 0; band < HMI_TOUCH349_HEIGHT / HMI_TOUCH349_BAND_ROWS; ++band) {
-        const int64_t wait_started = esp_timer_get_time();
-        ESP_RETURN_ON_FALSE(
-            xSemaphoreTake(transfer_done, pdMS_TO_TICKS(250)) == pdTRUE,
-            ESP_ERR_TIMEOUT,
-            TAG,
-            "previous DMA transfer"
-        );
-        wait_us += (uint32_t)(esp_timer_get_time() - wait_started);
+        // Two DMA buffers let the CPU prepare the next RGB565 band while QSPI
+        // sends the current band. Wait only when a buffer is about to be reused.
+        if (band >= 2) {
+            const int64_t wait_started = esp_timer_get_time();
+            ESP_RETURN_ON_FALSE(
+                xSemaphoreTake(transfer_done, pdMS_TO_TICKS(250)) == pdTRUE,
+                ESP_ERR_TIMEOUT,
+                TAG,
+                "previous DMA transfer"
+            );
+            wait_us += (uint32_t)(esp_timer_get_time() - wait_started);
+        }
 
         const size_t offset = band * HMI_TOUCH349_BAND_PIXELS;
+        uint16_t *dma_band = dma_bands[band & 1];
         for (size_t index = 0; index < HMI_TOUCH349_BAND_PIXELS; ++index) {
             dma_band[index] = __builtin_bswap16(framebuffer[offset + index]);
         }
@@ -333,14 +415,16 @@ int hmi_touch349_flush_full(hmi_touch349_flush_stats_t *stats) {
             "draw band"
         );
     }
-    const int64_t final_wait_started = esp_timer_get_time();
-    ESP_RETURN_ON_FALSE(
-        xSemaphoreTake(transfer_done, pdMS_TO_TICKS(250)) == pdTRUE,
-        ESP_ERR_TIMEOUT,
-        TAG,
-        "final DMA transfer"
-    );
-    wait_us += (uint32_t)(esp_timer_get_time() - final_wait_started);
+    for (uint16_t pending = 0; pending < 2; ++pending) {
+        const int64_t final_wait_started = esp_timer_get_time();
+        ESP_RETURN_ON_FALSE(
+            xSemaphoreTake(transfer_done, pdMS_TO_TICKS(250)) == pdTRUE,
+            ESP_ERR_TIMEOUT,
+            TAG,
+            "final DMA transfer"
+        );
+        wait_us += (uint32_t)(esp_timer_get_time() - final_wait_started);
+    }
 
     if (stats != NULL) {
         stats->flush_us = (uint32_t)(esp_timer_get_time() - started);
@@ -352,6 +436,11 @@ int hmi_touch349_flush_full(hmi_touch349_flush_stats_t *stats) {
 
 int hmi_touch349_backlight_set(uint8_t duty, bool enabled) {
     ESP_RETURN_ON_FALSE(expander != NULL, ESP_ERR_INVALID_STATE, TAG, "expander missing");
+    // A live device must never look dead. Active-low duty 204 is 20%
+    // brightness. Only the explicit shutdown path may disable the backlight.
+    if (enabled && duty > 204) {
+        duty = 204;
+    }
     const uint8_t applied_duty = enabled ? duty : 255;
     ESP_RETURN_ON_ERROR(
         ledc_set_duty(LEDC_LOW_SPEED_MODE, LEDC_CHANNEL_1, applied_duty),
@@ -409,6 +498,12 @@ int hmi_touch349_sd_mount(hmi_touch349_sd_stats_t *stats) {
     if (stats != NULL) {
         stats->capacity_bytes =
             (uint64_t)sd_card->csd.capacity * (uint64_t)sd_card->csd.sector_size;
+        DWORD free_clusters = 0;
+        FATFS *filesystem = NULL;
+        if (f_getfree("0:", &free_clusters, &filesystem) == FR_OK && filesystem != NULL) {
+            stats->free_bytes = (uint64_t)free_clusters *
+                (uint64_t)filesystem->csize * (uint64_t)sd_card->csd.sector_size;
+        }
         stats->sector_size = sd_card->csd.sector_size;
         stats->mounted = 1;
     }
@@ -443,6 +538,93 @@ int hmi_touch349_touch_read(uint8_t response[32]) {
         32,
         pdMS_TO_TICKS(100)
     );
+}
+
+int hmi_touch349_network_start(const char *ssid, const char *password) {
+    if (ssid == NULL || password == NULL || ssid[0] == '\0') {
+        return ESP_ERR_INVALID_ARG;
+    }
+    esp_err_t error = nvs_flash_init();
+    if (error == ESP_ERR_NVS_NO_FREE_PAGES || error == ESP_ERR_NVS_NEW_VERSION_FOUND) {
+        ESP_RETURN_ON_ERROR(nvs_flash_erase(), TAG, "erase NVS");
+        error = nvs_flash_init();
+    }
+    ESP_RETURN_ON_ERROR(error, TAG, "NVS init");
+    ESP_RETURN_ON_ERROR(esp_netif_init(), TAG, "network interface init");
+    error = esp_event_loop_create_default();
+    if (error != ESP_OK && error != ESP_ERR_INVALID_STATE) {
+        return error;
+    }
+    ESP_RETURN_ON_FALSE(esp_netif_create_default_wifi_sta() != NULL, ESP_FAIL, TAG, "Wi-Fi STA");
+    const wifi_init_config_t init_config = WIFI_INIT_CONFIG_DEFAULT();
+    ESP_RETURN_ON_ERROR(esp_wifi_init(&init_config), TAG, "Wi-Fi init");
+    ESP_RETURN_ON_ERROR(
+        esp_event_handler_register(WIFI_EVENT, ESP_EVENT_ANY_ID, network_event_handler, NULL),
+        TAG,
+        "Wi-Fi event handler"
+    );
+    ESP_RETURN_ON_ERROR(
+        esp_event_handler_register(IP_EVENT, IP_EVENT_STA_GOT_IP, network_event_handler, NULL),
+        TAG,
+        "IP event handler"
+    );
+    wifi_config_t config = {0};
+    strlcpy((char *)config.sta.ssid, ssid, sizeof(config.sta.ssid));
+    strlcpy((char *)config.sta.password, password, sizeof(config.sta.password));
+    config.sta.scan_method = WIFI_ALL_CHANNEL_SCAN;
+    config.sta.sort_method = WIFI_CONNECT_AP_BY_SIGNAL;
+    config.sta.threshold.authmode = WIFI_AUTH_OPEN;
+    config.sta.sae_pwe_h2e = WPA3_SAE_PWE_BOTH;
+    ESP_RETURN_ON_ERROR(esp_wifi_set_mode(WIFI_MODE_STA), TAG, "Wi-Fi station mode");
+    ESP_RETURN_ON_ERROR(esp_wifi_set_config(WIFI_IF_STA, &config), TAG, "Wi-Fi config");
+    ESP_RETURN_ON_ERROR(esp_wifi_set_ps(WIFI_PS_NONE), TAG, "Wi-Fi power save");
+    ESP_RETURN_ON_ERROR(esp_wifi_start(), TAG, "Wi-Fi start");
+    ESP_LOGI(TAG, "WIFI START ssid=%s", ssid);
+    return ESP_OK;
+}
+
+int hmi_touch349_network_stats(hmi_touch349_network_stats_t *stats) {
+    ESP_RETURN_ON_FALSE(stats != NULL, ESP_ERR_INVALID_ARG, TAG, "network stats");
+    memset(stats, 0, sizeof(*stats));
+    stats->connected = wifi_connected ? 1 : 0;
+    stats->ipv4 = station_ipv4;
+    time_t now = 0;
+    time(&now);
+    stats->time_synced = now > 1700000000 ? 1 : 0;
+    if (wifi_connected) {
+        wifi_ap_record_t record = {0};
+        if (esp_wifi_sta_get_ap_info(&record) == ESP_OK) {
+            stats->rssi_dbm = record.rssi;
+        }
+    }
+    return ESP_OK;
+}
+
+int hmi_touch349_battery_read(uint16_t *raw, uint32_t *millivolts) {
+    ESP_RETURN_ON_FALSE(raw != NULL && millivolts != NULL, ESP_ERR_INVALID_ARG, TAG, "battery stats");
+    int sample = 0;
+    ESP_RETURN_ON_ERROR(adc_oneshot_read(battery_adc, ADC_CHANNEL_3, &sample), TAG, "battery ADC read");
+    int adc_mv = 0;
+    if (battery_calibrated) {
+        ESP_RETURN_ON_ERROR(
+            adc_cali_raw_to_voltage(battery_calibration, sample, &adc_mv),
+            TAG,
+            "battery calibration"
+        );
+    } else {
+        adc_mv = sample * 3300 / 4095;
+    }
+    *raw = (uint16_t)sample;
+    *millivolts = (uint32_t)adc_mv * 3;
+    return ESP_OK;
+}
+
+uint32_t hmi_touch349_free_heap(void) {
+    return heap_caps_get_free_size(MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT);
+}
+
+uint32_t hmi_touch349_free_psram(void) {
+    return heap_caps_get_free_size(MALLOC_CAP_SPIRAM);
 }
 
 void hmi_touch349_power_off(void) {
