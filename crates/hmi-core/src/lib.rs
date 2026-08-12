@@ -291,13 +291,6 @@ impl AudioTelemetry {
         };
         Some(self.level_history[(oldest + chronological_index) % AUDIO_HISTORY_CAPACITY])
     }
-
-    fn history_peak(&self) -> u16 {
-        (0..self.history_len as usize)
-            .filter_map(|index| self.history_sample(index))
-            .max()
-            .unwrap_or(1)
-    }
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -1109,30 +1102,18 @@ fn draw_waveform<D: DrawTarget<Color = BinaryColor>>(
     Rectangle::new(Point::new(10, top), Size::new(280, height))
         .into_styled(PrimitiveStyle::with_stroke(INK, 1))
         .draw(display)?;
-    let center = top + height as i32 / 2;
-    Line::new(Point::new(14, center), Point::new(286, center))
+    let baseline = top + height as i32 - 5;
+    Line::new(Point::new(14, baseline), Point::new(286, baseline))
         .into_styled(PrimitiveStyle::with_stroke(INK, 1))
         .draw(display)?;
-    let scale = audio.history_peak().max(256) as u32;
     let len = audio.history_len as usize;
-    let mut previous = None;
     for index in 0..len {
         if let Some(sample) = audio.history_sample(index) {
             let x = 15 + index as i32 * 270 / (AUDIO_HISTORY_CAPACITY as i32 - 1);
-            let amplitude =
-                ((sample as u32 * (height - 8) / 2) / scale).min((height - 8) / 2) as i32;
-            let y = if index % 2 == 0 {
-                center - amplitude
-            } else {
-                center + amplitude
-            };
-            let point = Point::new(x, y);
-            if let Some(last) = previous {
-                Line::new(last, point)
-                    .into_styled(PrimitiveStyle::with_stroke(INK, 2))
-                    .draw(display)?;
-            }
-            previous = Some(point);
+            let level = level_height(sample, height - 8) as i32;
+            Line::new(Point::new(x, baseline), Point::new(x, baseline - level))
+                .into_styled(PrimitiveStyle::with_stroke(INK, 2))
+                .draw(display)?;
         }
     }
     Ok(())
@@ -2146,32 +2127,32 @@ fn touch_waveform<D: DrawTarget<Color = Rgb565>>(
     Rectangle::new(Point::new(x, y), Size::new(width, height))
         .into_styled(PrimitiveStyle::with_fill(TOUCH_SURFACE))
         .draw(display)?;
-    let center = y + height as i32 / 2;
-    let scale = audio.history_peak().max(256) as u32;
-    let mut previous = None;
+    // This is an RMS level history, not a signed PCM waveform. Keep zero on a
+    // stable bottom baseline. Alternating points above and below the center made
+    // the graph appear to flip even when the input level was steady.
+    let baseline = y + height as i32 - 7;
+    Line::new(
+        Point::new(x + 5, baseline),
+        Point::new(x + width as i32 - 6, baseline),
+    )
+    .into_styled(PrimitiveStyle::with_stroke(TOUCH_SURFACE_ALT, 1))
+    .draw(display)?;
     for index in 0..audio.history_len as usize {
         if let Some(sample) = audio.history_sample(index) {
             let px =
                 x + 5 + index as i32 * (width as i32 - 10) / (AUDIO_HISTORY_CAPACITY as i32 - 1);
-            let amplitude =
-                ((sample as u32 * (height - 12) / 2) / scale).min((height - 12) / 2) as i32;
-            let point = Point::new(
-                px,
-                if index % 2 == 0 {
-                    center - amplitude
-                } else {
-                    center + amplitude
-                },
-            );
-            if let Some(last) = previous {
-                Line::new(last, point)
-                    .into_styled(PrimitiveStyle::with_stroke(color, 2))
-                    .draw(display)?;
-            }
-            previous = Some(point);
+            let level = level_height(sample, height - 18) as i32;
+            let point = Point::new(px, baseline - level);
+            Line::new(Point::new(px, baseline), point)
+                .into_styled(PrimitiveStyle::with_stroke(color, 2))
+                .draw(display)?;
         }
     }
     Ok(())
+}
+
+fn level_height(sample: u16, available_height: u32) -> u32 {
+    (u32::from(sample).min(32_768) * available_height) / 32_768
 }
 
 fn touch_text<D: DrawTarget<Color = Rgb565>>(
@@ -2402,6 +2383,17 @@ mod tests {
             audio.history_sample(AUDIO_HISTORY_CAPACITY - 1),
             Some(AUDIO_HISTORY_CAPACITY as u16 + 4)
         );
+    }
+
+    #[test]
+    fn audio_level_height_is_fixed_scale_and_monotonic() {
+        assert_eq!(level_height(0, 100), 0);
+        assert_eq!(level_height(16_384, 100), 50);
+        assert_eq!(level_height(32_768, 100), 100);
+        assert_eq!(level_height(u16::MAX, 100), 100);
+        for sample in 0..32_768u16 {
+            assert!(level_height(sample, 100) <= level_height(sample + 1, 100));
+        }
     }
 
     #[test]

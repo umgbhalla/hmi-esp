@@ -11,6 +11,7 @@ set(CODEC_SOURCES
     "${CODEC_ROOT}/platform/audio_codec_ctrl_spi.c"
     "${CODEC_ROOT}/platform/esp_codec_dev_os.c"
     "${CODEC_ROOT}/device/es7210/es7210.c"
+    "${CODEC_ROOT}/device/es8311/es8311.c"
 )
 
 idf_component_register(

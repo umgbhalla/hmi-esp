@@ -18,7 +18,9 @@ mod firmware {
 
     use anyhow::{anyhow, ensure, Context};
     use esp_idf_sys::hmi_touch349::{
-        hmi_touch349_audio_read_levels, hmi_touch349_backlight_set, hmi_touch349_battery_read,
+        hmi_touch349_audio_output_ready, hmi_touch349_audio_pending,
+        hmi_touch349_audio_read_levels, hmi_touch349_audio_stop, hmi_touch349_audio_volume_set,
+        hmi_touch349_audio_write, hmi_touch349_backlight_set, hmi_touch349_battery_read,
         hmi_touch349_console_read, hmi_touch349_flush_full, hmi_touch349_flush_stats_t,
         hmi_touch349_framebuffer, hmi_touch349_free_heap, hmi_touch349_free_psram,
         hmi_touch349_init, hmi_touch349_network_scan, hmi_touch349_network_start,
@@ -44,6 +46,88 @@ mod firmware {
     struct RenderStats {
         frame_us: u32,
         flush_us: u32,
+    }
+
+    struct WavPlayer {
+        file: File,
+        data_start: u64,
+        data_len: u64,
+        position: u64,
+    }
+
+    impl WavPlayer {
+        fn open(entry: &FileEntry) -> anyhow::Result<Self> {
+            let mut file = File::open(safe_sd_path(&entry.name)?)?;
+            let mut header = [0u8; 44];
+            file.read_exact(&mut header)?;
+            ensure!(
+                &header[0..4] == b"RIFF" && &header[8..12] == b"WAVE",
+                "invalid WAV"
+            );
+            ensure!(
+                &header[12..16] == b"fmt " && &header[36..40] == b"data",
+                "unsupported WAV layout"
+            );
+            ensure!(
+                u16::from_le_bytes([header[20], header[21]]) == 1,
+                "WAV is not PCM"
+            );
+            ensure!(
+                u16::from_le_bytes([header[22], header[23]]) == 2,
+                "WAV is not stereo"
+            );
+            ensure!(
+                u32::from_le_bytes(header[24..28].try_into().unwrap()) == 24_000,
+                "WAV is not 24 kHz"
+            );
+            ensure!(
+                u16::from_le_bytes([header[34], header[35]]) == 16,
+                "WAV is not 16-bit"
+            );
+            let data_len = u32::from_le_bytes(header[40..44].try_into().unwrap()) as u64;
+            ensure!(
+                44u64.saturating_add(data_len) <= file.metadata()?.len(),
+                "WAV data is truncated"
+            );
+            file.seek(SeekFrom::Start(44))?;
+            Ok(Self {
+                file,
+                data_start: 44,
+                data_len,
+                position: 0,
+            })
+        }
+
+        fn read_samples(&mut self, output: &mut [i16]) -> anyhow::Result<usize> {
+            let wanted = self
+                .data_len
+                .saturating_sub(self.position)
+                .min((output.len() * 2) as u64) as usize;
+            if wanted < 2 {
+                return Ok(0);
+            }
+            let mut bytes = [0u8; 2048];
+            self.file.read_exact(&mut bytes[..wanted])?;
+            for index in 0..wanted / 2 {
+                output[index] = i16::from_le_bytes([bytes[index * 2], bytes[index * 2 + 1]]);
+            }
+            self.position += wanted as u64;
+            Ok(wanted / 2)
+        }
+
+        fn duration_ms(&self) -> u64 {
+            self.data_len.saturating_mul(1000) / 96_000
+        }
+
+        fn position_ms(&self) -> u64 {
+            self.position.saturating_mul(1000) / 96_000
+        }
+
+        fn rewind(&mut self) -> anyhow::Result<()> {
+            self.file.seek(SeekFrom::Start(self.data_start))?;
+            self.position = 0;
+            Ok(())
+        }
     }
 
     fn flush() -> anyhow::Result<hmi_touch349_flush_stats_t> {
@@ -168,6 +252,11 @@ mod firmware {
     }
 
     fn safe_sd_path(name: &str) -> anyhow::Result<PathBuf> {
+        ensure!(
+            !name.is_empty() && name != ".",
+            "empty SD path is not allowed"
+        );
+        ensure!(name != "REC.TMP", "recorder temporary file is protected");
         let relative = Path::new(name);
         ensure!(!relative.is_absolute(), "absolute SD path is not allowed");
         ensure!(
@@ -242,29 +331,6 @@ mod firmware {
         Ok(())
     }
 
-    fn wav_duration_ms(entry: &FileEntry) -> anyhow::Result<u64> {
-        let mut file = File::open(safe_sd_path(&entry.name)?)?;
-        let mut header = [0u8; 44];
-        file.read_exact(&mut header)?;
-        ensure!(
-            &header[0..4] == b"RIFF" && &header[8..12] == b"WAVE",
-            "invalid WAV"
-        );
-        ensure!(
-            &header[12..16] == b"fmt " && &header[36..40] == b"data",
-            "unsupported WAV layout"
-        );
-        let channels = u16::from_le_bytes([header[22], header[23]]);
-        let rate = u32::from_le_bytes(header[24..28].try_into().unwrap());
-        let bits = u16::from_le_bytes([header[34], header[35]]);
-        ensure!(
-            channels == 2 && rate == 24_000 && bits == 16,
-            "WAV must be 24 kHz stereo 16-bit PCM"
-        );
-        let bytes = u32::from_le_bytes(header[40..44].try_into().unwrap()) as u64;
-        Ok(bytes.saturating_mul(1000) / (24_000 * 2 * 2))
-    }
-
     fn next_recording_name(_state: &DashboardState, now_ms: u64) -> String {
         // FAT long names are disabled. Keep every name inside the 8.3 format.
         let seed = (now_ms / 1000) as u32 % 1_000_000;
@@ -283,6 +349,7 @@ mod firmware {
         sd: &mut hmi_touch349_sd_stats_t,
         now_ms: u64,
         recording_stop_pending: &mut bool,
+        player: &mut Option<WavPlayer>,
     ) -> anyhow::Result<()> {
         match action {
             UiAction::RefreshFiles => refresh_storage(state, sd),
@@ -296,6 +363,8 @@ mod firmware {
             UiAction::ToggleRecording => {
                 ensure!(state.storage.mounted, "SD card is not mounted");
                 ensure!(state.audio.health == Health::Ok, "microphone is not ready");
+                *player = None;
+                state.playing = false;
                 let name = next_recording_name(state, now_ms);
                 let c_name = CString::new(name.as_str()).expect("generated name contains NUL");
                 let result = unsafe { hmi_touch349_recorder_start(c_name.as_ptr()) };
@@ -318,14 +387,14 @@ mod firmware {
                     .find(|entry| entry.name == state.last_recording)
                     .cloned()
                     .ok_or_else(|| anyhow!("last recording is not on the SD card"))?;
-                open_media_entry(entry, state)
+                open_media_entry(entry, state, player)
             }
             UiAction::OpenSelectedFile => {
                 let entry = state
                     .selected_file()
                     .cloned()
                     .ok_or_else(|| anyhow!("no SD file is selected"))?;
-                open_media_entry(entry, state)
+                open_media_entry(entry, state, player)
             }
             UiAction::ViewerNext => {
                 ensure!(!state.viewer_name.is_empty(), "no file is open");
@@ -352,6 +421,11 @@ mod firmware {
             }
             UiAction::StopPlayback => {
                 state.playing = false;
+                unsafe { hmi_touch349_audio_stop(std::ptr::null_mut()) };
+                if let Some(player) = player.as_mut() {
+                    player.rewind()?;
+                }
+                state.playback_position_ms = 0;
                 Ok(())
             }
             UiAction::RefreshDisplay => Ok(()),
@@ -359,12 +433,29 @@ mod firmware {
                 state.prepare_poweroff_requested = true;
                 Ok(())
             }
-            UiAction::TogglePlayback | UiAction::CycleVolume | UiAction::SpeakerTest => {
-                state.playing = false;
-                Err(anyhow!(
-                    "speaker playback is not installed in this firmware"
-                ))
+            UiAction::TogglePlayback => {
+                ensure!(player.is_some(), "no WAV file is open");
+                ensure!(!state.recording, "stop recording before playback");
+                ensure!(
+                    state.playing || unsafe { hmi_touch349_audio_output_ready() } == 1,
+                    "speaker output is not ready"
+                );
+                state.playing = !state.playing;
+                Ok(())
             }
+            UiAction::CycleVolume => {
+                state.speaker_volume = match state.speaker_volume {
+                    0..=40 => 55,
+                    41..=55 => 70,
+                    56..=70 => 85,
+                    71..=85 => 100,
+                    _ => 40,
+                };
+                let result = unsafe { hmi_touch349_audio_volume_set(state.speaker_volume) };
+                ensure!(result == 0, "speaker volume failed: {result}");
+                Ok(())
+            }
+            UiAction::SpeakerTest => Err(anyhow!("speaker test is not exposed on this screen")),
             UiAction::ToggleEventLog => {
                 state.event_logging_enabled = !state.event_logging_enabled;
                 Ok(())
@@ -372,17 +463,81 @@ mod firmware {
         }
     }
 
-    fn open_media_entry(entry: FileEntry, state: &mut DashboardState) -> anyhow::Result<()> {
+    fn open_media_entry(
+        entry: FileEntry,
+        state: &mut DashboardState,
+        player: &mut Option<WavPlayer>,
+    ) -> anyhow::Result<()> {
         if entry.kind == FileKind::Wav {
-            state.playback_duration_ms = wav_duration_ms(&entry)?;
+            let opened = WavPlayer::open(&entry)?;
+            state.playback_duration_ms = opened.duration_ms();
             state.playback_position_ms = 0;
             state.playback_name = entry.name;
             state.playback_audio.health = Health::Error;
             state.playing = false;
             state.view = View::Player;
+            *player = Some(opened);
             Ok(())
         } else {
+            *player = None;
             open_viewer(&entry, 0, state)
+        }
+    }
+
+    fn service_playback(player: &mut Option<WavPlayer>, state: &mut DashboardState) -> bool {
+        if !state.playing {
+            return false;
+        }
+        let Some(player) = player.as_mut() else {
+            state.playing = false;
+            return true;
+        };
+        let mut samples = [0i16; 1024];
+        match player.read_samples(&mut samples) {
+            Ok(0) => {
+                if unsafe { hmi_touch349_audio_pending() } == 0 {
+                    state.playing = false;
+                    let _ = player.rewind();
+                    state.playback_position_ms = 0;
+                    true
+                } else {
+                    false
+                }
+            }
+            Ok(count) => {
+                let previous_position_ms = state.playback_position_ms;
+                let result = unsafe { hmi_touch349_audio_write(samples.as_ptr(), count) };
+                if result != 0 {
+                    println!("PLAYBACK ERROR write={result}");
+                    state.playing = false;
+                    return true;
+                }
+                state.playback_position_ms = player.position_ms();
+                let mut peak = 0u16;
+                let mut square_sum = 0u64;
+                let mut frame_count = 0u64;
+                for sample in samples[..count].iter().step_by(2) {
+                    let magnitude = sample.unsigned_abs();
+                    peak = peak.max(magnitude);
+                    square_sum = square_sum.saturating_add(u64::from(magnitude).pow(2));
+                    frame_count += 1;
+                }
+                let rms = if frame_count == 0 {
+                    0
+                } else {
+                    (square_sum / frame_count).isqrt().min(u64::from(u16::MAX)) as u16
+                };
+                state.playback_audio.health = Health::Ok;
+                state.playback_audio.rms = rms;
+                state.playback_audio.peak = peak;
+                state.playback_audio.push_level(rms);
+                previous_position_ms / 250 != state.playback_position_ms / 250
+            }
+            Err(error) => {
+                println!("PLAYBACK ERROR read={error:#}");
+                state.playing = false;
+                true
+            }
         }
     }
 
@@ -412,10 +567,10 @@ mod firmware {
         state.audio.rms = stats.rms.min(u32::from(u16::MAX)) as u16;
         state.audio.peak = stats.peak.min(u32::from(u16::MAX)) as u16;
         state.audio.frames_total = stats.bytes_written / 4;
-        state.audio.push_level(state.audio.rms);
         state.recording_bytes = stats.bytes_written;
         if stats.recording == 1 {
             state.recording = true;
+            state.audio.push_level(state.audio.rms);
             return true;
         }
         if state.recording || *recording_stop_pending {
@@ -480,6 +635,8 @@ mod firmware {
         network: &mut hmi_touch349_network_stats_t,
         now_ms: u64,
         recording_stop_pending: &mut bool,
+        player: &mut Option<WavPlayer>,
+        pending_delete: &mut Option<(String, u64)>,
     ) -> bool {
         let command = command.trim();
         if command.is_empty() {
@@ -489,17 +646,19 @@ mod firmware {
         let result = (|| -> anyhow::Result<()> {
             match command {
                 "help" => {
-                    println!("CMD commands=help,status,wifi scan,sd scan,record start,record stop");
+                    println!("CMD commands=help,status,wifi scan,sd scan,files,file stat NAME,file read NAME,file delete prepare NAME,file delete confirm NAME,play open NAME,play start,play stop,play close,record start,record stop");
                     Ok(())
                 }
                 "status" => {
                     unsafe { hmi_touch349_network_stats(network) };
                     println!(
-                    "CMD STATUS view={} sd={} files={} wifi={} target={} channel={} reason={} retries={} time={} rec={} bytes={} mic={} rms={} peak={} brightness={}",
+                        "CMD STATUS view={} sd={} files={} wifi={} target={} channel={} reason={} retries={} time={} rec={} bytes={} speaker={} playing={} play_ms={} mic={} rms={} peak={} brightness={}",
                     state.view.title(), sd.mounted, state.files.len(), network.connected,
                     network.target_visible, network.target_channel, network.last_disconnect_reason,
                     network.reconnects, network.time_synced, state.recording,
-                    state.recording_bytes, state.audio.health.label(), state.audio.rms,
+                    state.recording_bytes, unsafe { hmi_touch349_audio_output_ready() },
+                    state.playing, state.playback_position_ms,
+                    state.audio.health.label(), state.audio.rms,
                     state.audio.peak, state.display_brightness.max(MIN_BRIGHTNESS_PERCENT),
                 );
                     Ok(())
@@ -527,12 +686,53 @@ mod firmware {
                     );
                     Ok(())
                 }
+                "files" => {
+                    refresh_storage(state, sd)?;
+                    println!("CMD FILES count={}", state.files.len());
+                    for (index, entry) in state.files.iter().enumerate() {
+                        println!(
+                            "CMD FILE index={} kind={:?} bytes={} name={}",
+                            index, entry.kind, entry.size, entry.name
+                        );
+                    }
+                    Ok(())
+                }
+                "play start" => handle_action(
+                    UiAction::TogglePlayback,
+                    state,
+                    sd,
+                    now_ms,
+                    recording_stop_pending,
+                    player,
+                ),
+                "play stop" => {
+                    ensure!(state.playing || player.is_some(), "no WAV file is open");
+                    handle_action(
+                        UiAction::StopPlayback,
+                        state,
+                        sd,
+                        now_ms,
+                        recording_stop_pending,
+                        player,
+                    )
+                }
+                "play close" => {
+                    state.playing = false;
+                    unsafe { hmi_touch349_audio_stop(std::ptr::null_mut()) };
+                    *player = None;
+                    state.playback_name.clear();
+                    state.playback_position_ms = 0;
+                    state.playback_duration_ms = 0;
+                    state.view = View::Files;
+                    Ok(())
+                }
                 "record start" => handle_action(
                     UiAction::ToggleRecording,
                     state,
                     sd,
                     now_ms,
                     recording_stop_pending,
+                    player,
                 ),
                 "record stop" => {
                     ensure!(state.recording, "recorder is not active");
@@ -542,7 +742,102 @@ mod firmware {
                         sd,
                         now_ms,
                         recording_stop_pending,
+                        player,
                     )
+                }
+                _ if command.starts_with("file stat ") => {
+                    let name = command.trim_start_matches("file stat ").trim();
+                    ensure!(!name.is_empty(), "file name is required");
+                    let path = safe_sd_path(name)?;
+                    let metadata = fs::metadata(&path).with_context(|| format!("stat {name}"))?;
+                    ensure!(metadata.is_file(), "path is not a file");
+                    println!(
+                        "CMD FILE STAT kind={:?} bytes={} readonly={} name={}",
+                        file_kind(name),
+                        metadata.len(),
+                        metadata.permissions().readonly(),
+                        name
+                    );
+                    Ok(())
+                }
+                _ if command.starts_with("file read ") => {
+                    let name = command.trim_start_matches("file read ").trim();
+                    ensure!(!name.is_empty(), "file name is required");
+                    let path = safe_sd_path(name)?;
+                    let mut file = File::open(&path).with_context(|| format!("open {name}"))?;
+                    ensure!(file.metadata()?.is_file(), "path is not a file");
+                    let mut bytes = [0u8; 256];
+                    let count = file.read(&mut bytes)?;
+                    println!("CMD FILE READ name={} bytes={} encoding=hex", name, count);
+                    for (offset, chunk) in bytes[..count].chunks(16).enumerate() {
+                        let hex = chunk
+                            .iter()
+                            .map(|byte| format!("{byte:02X}"))
+                            .collect::<Vec<_>>()
+                            .join(" ");
+                        println!("CMD DATA offset={:04X} {hex}", offset * 16);
+                    }
+                    Ok(())
+                }
+                _ if command.starts_with("file delete prepare ") => {
+                    let name = command.trim_start_matches("file delete prepare ").trim();
+                    ensure!(!name.is_empty(), "file name is required");
+                    ensure!(
+                        !state.recording || state.recording_name != name,
+                        "active recording cannot be deleted"
+                    );
+                    ensure!(
+                        state.playback_name != name,
+                        "open WAV cannot be deleted; send play stop and open another view"
+                    );
+                    let path = safe_sd_path(name)?;
+                    ensure!(fs::metadata(&path)?.is_file(), "path is not a file");
+                    *pending_delete = Some((name.to_owned(), now_ms.saturating_add(10_000)));
+                    println!(
+                        "CMD DELETE ARMED name={} expires_ms={} confirm=\"file delete confirm {}\"",
+                        name,
+                        now_ms.saturating_add(10_000),
+                        name
+                    );
+                    Ok(())
+                }
+                _ if command.starts_with("file delete confirm ") => {
+                    let name = command.trim_start_matches("file delete confirm ").trim();
+                    let (armed_name, expires_ms) = pending_delete
+                        .as_ref()
+                        .ok_or_else(|| anyhow!("delete is not armed"))?;
+                    ensure!(now_ms <= *expires_ms, "delete confirmation expired");
+                    ensure!(armed_name == name, "delete name does not match armed file");
+                    ensure!(
+                        !state.recording || state.recording_name != name,
+                        "active recording cannot be deleted"
+                    );
+                    ensure!(
+                        state.playback_name != name,
+                        "open WAV cannot be deleted; send play close"
+                    );
+                    ensure!(
+                        fs::metadata(safe_sd_path(name)?)?.is_file(),
+                        "path is not a file"
+                    );
+                    fs::remove_file(safe_sd_path(name)?)
+                        .with_context(|| format!("delete {name}"))?;
+                    *pending_delete = None;
+                    refresh_storage(state, sd)?;
+                    println!("CMD FILE DELETED name={name}");
+                    Ok(())
+                }
+                _ if command.starts_with("play open ") => {
+                    let name = command.trim_start_matches("play open ").trim();
+                    refresh_storage(state, sd)?;
+                    let entry = state
+                        .files
+                        .iter()
+                        .find(|entry| entry.name == name)
+                        .cloned()
+                        .ok_or_else(|| anyhow!("file not found"))?;
+                    ensure!(entry.kind == FileKind::Wav, "file is not a WAV recording");
+                    open_media_entry(entry, state, player)
                 }
                 _ => Err(anyhow!("unknown command; send help")),
             }
@@ -561,6 +856,8 @@ mod firmware {
         network: &mut hmi_touch349_network_stats_t,
         now_ms: u64,
         recording_stop_pending: &mut bool,
+        player: &mut Option<WavPlayer>,
+        pending_delete: &mut Option<(String, u64)>,
     ) -> bool {
         let mut input = [0u8; 64];
         let count = unsafe { hmi_touch349_console_read(input.as_mut_ptr(), input.len()) };
@@ -579,6 +876,8 @@ mod firmware {
                             network,
                             now_ms,
                             recording_stop_pending,
+                            player,
+                            pending_delete,
                         );
                         line.clear();
                     }
@@ -735,6 +1034,8 @@ mod firmware {
         let mut live_data_refresh = Instant::now() - Duration::from_secs(2);
         let mut recorder_refresh = Instant::now() - Duration::from_secs(1);
         let mut recording_stop_pending = false;
+        let mut player: Option<WavPlayer> = None;
+        let mut pending_delete: Option<(String, u64)> = None;
         let mut console_line = String::new();
         let mut network = hmi_touch349_network_stats_t {
             ipv4: 0,
@@ -756,6 +1057,8 @@ mod firmware {
                 &mut network,
                 now_ms,
                 &mut recording_stop_pending,
+                &mut player,
+                &mut pending_delete,
             );
             let power_pressed = unsafe { hmi_touch349_power_button_pressed() };
             if power_pressed {
@@ -808,6 +1111,7 @@ mod firmware {
                                 &mut sd,
                                 now_ms,
                                 &mut recording_stop_pending,
+                                &mut player,
                             ) {
                                 println!("ACTION ERROR action={action:?} error={error:#}");
                                 state.record(now_ms, "ACTION", format!("{action:?}: {error}"));
@@ -822,8 +1126,12 @@ mod firmware {
             }
 
             state.runtime.uptime_ms = now_ms;
+            redraw |= service_playback(&mut player, &mut state);
             if recorder_refresh.elapsed() >= Duration::from_millis(100) {
-                redraw |= poll_recorder(&mut state, &mut sd, now_ms, &mut recording_stop_pending);
+                if !state.playing {
+                    redraw |=
+                        poll_recorder(&mut state, &mut sd, now_ms, &mut recording_stop_pending);
+                }
                 recorder_refresh = Instant::now();
             }
             if live_data_refresh.elapsed() >= Duration::from_secs(1) {
@@ -858,7 +1166,9 @@ mod firmware {
                 );
                 heartbeat = Instant::now();
             }
-            thread::sleep(TOUCH_POLL);
+            if !state.playing {
+                thread::sleep(TOUCH_POLL);
+            }
         }
     }
 }

@@ -34,6 +34,7 @@
 #include "esp_codec_dev.h"
 #include "esp_codec_dev_defaults.h"
 #include "freertos/FreeRTOS.h"
+#include "freertos/queue.h"
 #include "freertos/semphr.h"
 #include "freertos/task.h"
 #include "sdmmc_cmd.h"
@@ -52,9 +53,12 @@
 #define AUDIO_BCLK GPIO_NUM_15
 #define AUDIO_WS GPIO_NUM_46
 #define AUDIO_DIN GPIO_NUM_6
+#define AUDIO_DOUT GPIO_NUM_45
 #define AUDIO_SAMPLE_RATE 24000
 #define AUDIO_CHANNELS 2
 #define AUDIO_BITS 16
+#define AUDIO_PLAYBACK_SAMPLES 1024
+#define AUDIO_PLAYBACK_QUEUE_DEPTH 4
 
 #define SYSTEM_I2C_SDA GPIO_NUM_47
 #define SYSTEM_I2C_SCL GPIO_NUM_48
@@ -94,7 +98,13 @@ static uint8_t wifi_target_channel;
 static char wifi_target_ssid[33];
 static bool wifi_manual_scan;
 static i2s_chan_handle_t audio_rx_channel;
+static i2s_chan_handle_t audio_tx_channel;
 static esp_codec_dev_handle_t audio_record_device;
+static esp_codec_dev_handle_t audio_play_device;
+static bool audio_output_open;
+static QueueHandle_t audio_playback_queue;
+static TaskHandle_t audio_playback_task_handle;
+static volatile bool audio_output_busy;
 static TaskHandle_t recorder_task_handle;
 static SemaphoreHandle_t recorder_lock;
 static SemaphoreHandle_t audio_read_lock;
@@ -103,6 +113,31 @@ static hmi_touch349_recorder_stats_t recorder_stats;
 static char recorder_part_path[160];
 static char recorder_final_path[160];
 static bool initialized;
+
+typedef struct {
+    size_t sample_count;
+    int16_t samples[AUDIO_PLAYBACK_SAMPLES];
+} audio_playback_block_t;
+
+static void audio_playback_task(void *argument) {
+    (void)argument;
+    audio_playback_block_t block;
+    while (true) {
+        if (xQueueReceive(audio_playback_queue, &block, portMAX_DELAY) != pdTRUE) {
+            continue;
+        }
+        audio_output_busy = true;
+        const int result = esp_codec_dev_write(
+            audio_play_device,
+            block.samples,
+            (int)(block.sample_count * sizeof(int16_t))
+        );
+        audio_output_busy = false;
+        if (result != ESP_CODEC_DEV_OK) {
+            ESP_LOGE(TAG, "PLAYBACK write failed: %d", result);
+        }
+    }
+}
 
 // Exact external initialization sequence used by the pinned Waveshare V2
 // ESP-IDF display, battery, audio, LVGL, and factory examples.
@@ -307,7 +342,7 @@ static esp_err_t init_audio_input(void) {
         I2S_CHANNEL_DEFAULT_CONFIG(I2S_NUM_AUTO, I2S_ROLE_MASTER);
     channel_config.auto_clear = true;
     ESP_RETURN_ON_ERROR(
-        i2s_new_channel(&channel_config, NULL, &audio_rx_channel),
+        i2s_new_channel(&channel_config, &audio_tx_channel, &audio_rx_channel),
         TAG,
         "audio RX channel"
     );
@@ -324,7 +359,7 @@ static esp_err_t init_audio_input(void) {
             .mclk = AUDIO_MCLK,
             .bclk = AUDIO_BCLK,
             .ws = AUDIO_WS,
-            .dout = I2S_GPIO_UNUSED,
+            .dout = AUDIO_DOUT,
             .din = AUDIO_DIN,
             .invert_flags = {
                 .mclk_inv = false,
@@ -339,7 +374,13 @@ static esp_err_t init_audio_input(void) {
         TAG,
         "audio TDM mode"
     );
+    ESP_RETURN_ON_ERROR(
+        i2s_channel_init_tdm_mode(audio_tx_channel, &tdm_config),
+        TAG,
+        "audio TX TDM mode"
+    );
     ESP_RETURN_ON_ERROR(i2s_channel_enable(audio_rx_channel), TAG, "audio RX enable");
+    ESP_RETURN_ON_ERROR(i2s_channel_enable(audio_tx_channel), TAG, "audio TX enable");
 
     audio_codec_i2c_cfg_t i2c_config = {
         .port = I2C_NUM_0,
@@ -351,7 +392,7 @@ static esp_err_t init_audio_input(void) {
     audio_codec_i2s_cfg_t i2s_config = {
         .port = I2S_NUM_0,
         .rx_handle = audio_rx_channel,
-        .tx_handle = NULL,
+        .tx_handle = audio_tx_channel,
     };
     const audio_codec_data_if_t *data = audio_codec_new_i2s_data(&i2s_config);
     ESP_RETURN_ON_FALSE(data != NULL, ESP_ERR_NO_MEM, TAG, "ES7210 data");
@@ -393,6 +434,9 @@ static esp_err_t init_audio_input(void) {
         TAG,
         "ES7210 gain"
     );
+
+    // Input recording stays usable if the independent speaker codec is absent
+    // or fails to start. Output readiness is reported separately.
     recorder_lock = xSemaphoreCreateMutex();
     audio_read_lock = xSemaphoreCreateMutex();
     ESP_RETURN_ON_FALSE(
@@ -402,6 +446,65 @@ static esp_err_t init_audio_input(void) {
         "audio locks"
     );
     recorder_stats.ready = 1;
+
+    audio_codec_i2c_cfg_t output_i2c_config = {
+        .port = I2C_NUM_0,
+        .addr = ES8311_CODEC_DEFAULT_ADDR,
+        .bus_handle = system_i2c_bus,
+    };
+    const audio_codec_ctrl_if_t *output_control = audio_codec_new_i2c_ctrl(&output_i2c_config);
+    ESP_RETURN_ON_FALSE(output_control != NULL, ESP_ERR_NO_MEM, TAG, "ES8311 control");
+    es8311_codec_cfg_t output_codec_config = {
+        .ctrl_if = output_control,
+        .gpio_if = audio_codec_new_gpio(),
+        .codec_mode = ESP_CODEC_DEV_WORK_MODE_DAC,
+        .pa_pin = -1,
+        .master_mode = false,
+        .use_mclk = true,
+        .mclk_div = 256,
+        .hw_gain = {.pa_gain = 6},
+    };
+    const audio_codec_if_t *output_codec = es8311_codec_new(&output_codec_config);
+    ESP_RETURN_ON_FALSE(output_codec != NULL, ESP_FAIL, TAG, "ES8311 codec");
+    esp_codec_dev_cfg_t output_device_config = {
+        .dev_type = ESP_CODEC_DEV_TYPE_OUT,
+        .codec_if = output_codec,
+        .data_if = data,
+    };
+    audio_play_device = esp_codec_dev_new(&output_device_config);
+    ESP_RETURN_ON_FALSE(audio_play_device != NULL, ESP_FAIL, TAG, "audio output device");
+    ESP_RETURN_ON_FALSE(
+        esp_codec_dev_open(audio_play_device, &sample_config) == ESP_CODEC_DEV_OK,
+        ESP_FAIL,
+        TAG,
+        "open ES8311 output"
+    );
+    ESP_RETURN_ON_FALSE(
+        esp_codec_dev_set_out_vol(audio_play_device, 55) == ESP_CODEC_DEV_OK,
+        ESP_FAIL,
+        TAG,
+        "ES8311 volume"
+    );
+    audio_output_open = true;
+    audio_playback_queue = xQueueCreate(
+        AUDIO_PLAYBACK_QUEUE_DEPTH,
+        sizeof(audio_playback_block_t)
+    );
+    ESP_RETURN_ON_FALSE(audio_playback_queue != NULL, ESP_ERR_NO_MEM, TAG, "playback queue");
+    ESP_RETURN_ON_FALSE(
+        xTaskCreatePinnedToCore(
+            audio_playback_task,
+            "audio_playback",
+            6144,
+            NULL,
+            9,
+            &audio_playback_task_handle,
+            1
+        ) == pdPASS,
+        ESP_ERR_NO_MEM,
+        TAG,
+        "playback task"
+    );
     ESP_LOGI(
         TAG,
         "AUDIO READY ES7210 TDM %uHz %uch GPIO mclk=%d bclk=%d ws=%d din=%d",
@@ -797,6 +900,53 @@ int hmi_touch349_audio_read_levels(uint32_t *rms, uint32_t *peak) {
         "audio level read"
     );
     audio_levels(samples, sizeof(samples) / sizeof(samples[0]), rms, peak);
+    return ESP_OK;
+}
+
+int hmi_touch349_audio_write(const int16_t *samples, size_t sample_count) {
+    ESP_RETURN_ON_FALSE(
+        samples != NULL && sample_count > 0 && sample_count <= AUDIO_PLAYBACK_SAMPLES &&
+            audio_output_open && audio_playback_queue != NULL && recorder_stats.recording == 0,
+        ESP_ERR_INVALID_STATE,
+        TAG,
+        "audio output unavailable"
+    );
+    audio_playback_block_t block = {.sample_count = sample_count};
+    memcpy(block.samples, samples, sample_count * sizeof(int16_t));
+    return xQueueSend(audio_playback_queue, &block, pdMS_TO_TICKS(1000)) == pdTRUE
+        ? ESP_OK
+        : ESP_ERR_TIMEOUT;
+}
+
+int hmi_touch349_audio_volume_set(uint8_t percent) {
+    ESP_RETURN_ON_FALSE(audio_output_open, ESP_ERR_INVALID_STATE, TAG, "speaker unavailable");
+    return esp_codec_dev_set_out_vol(audio_play_device, percent > 100 ? 100 : percent);
+}
+
+int hmi_touch349_audio_output_ready(void) {
+    return audio_output_open && audio_playback_queue != NULL &&
+            audio_playback_task_handle != NULL
+        ? 1
+        : 0;
+}
+
+int hmi_touch349_audio_pending(void) {
+    if (audio_playback_queue == NULL) {
+        return 0;
+    }
+    return (int)uxQueueMessagesWaiting(audio_playback_queue) + (audio_output_busy ? 1 : 0);
+}
+
+int hmi_touch349_audio_stop(uint32_t *dropped_samples) {
+    ESP_RETURN_ON_FALSE(audio_playback_queue != NULL, ESP_ERR_INVALID_STATE, TAG, "speaker unavailable");
+    uint32_t dropped = 0;
+    audio_playback_block_t block;
+    while (xQueueReceive(audio_playback_queue, &block, 0) == pdTRUE) {
+        dropped += (uint32_t)block.sample_count;
+    }
+    if (dropped_samples != NULL) {
+        *dropped_samples = dropped;
+    }
     return ESP_OK;
 }
 
