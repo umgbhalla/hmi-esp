@@ -1,9 +1,13 @@
 #include "hmi_touch349.h"
 
+#include <stdio.h>
+#include <stdlib.h>
 #include <string.h>
+#include <unistd.h>
 
 #include "driver/gpio.h"
 #include "driver/i2c_master.h"
+#include "driver/i2s_tdm.h"
 #include "driver/ledc.h"
 #include "driver/sdmmc_host.h"
 #include "driver/spi_master.h"
@@ -26,6 +30,9 @@
 #include "nvs_flash.h"
 #include "esp_timer.h"
 #include "esp_vfs_fat.h"
+#include "hal/usb_serial_jtag_ll.h"
+#include "esp_codec_dev.h"
+#include "esp_codec_dev_defaults.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/semphr.h"
 #include "freertos/task.h"
@@ -40,6 +47,14 @@
 #define LCD_D3 GPIO_NUM_14
 #define LCD_BACKLIGHT GPIO_NUM_42
 #define POWER_BUTTON GPIO_NUM_16
+
+#define AUDIO_MCLK GPIO_NUM_7
+#define AUDIO_BCLK GPIO_NUM_15
+#define AUDIO_WS GPIO_NUM_46
+#define AUDIO_DIN GPIO_NUM_6
+#define AUDIO_SAMPLE_RATE 24000
+#define AUDIO_CHANNELS 2
+#define AUDIO_BITS 16
 
 #define SYSTEM_I2C_SDA GPIO_NUM_47
 #define SYSTEM_I2C_SCL GPIO_NUM_48
@@ -60,6 +75,7 @@
 static const char *TAG = "touch349_minimal";
 static esp_lcd_panel_handle_t panel;
 static esp_io_expander_handle_t expander;
+static i2c_master_bus_handle_t system_i2c_bus;
 static SemaphoreHandle_t transfer_done;
 static uint16_t *framebuffer;
 static uint16_t *dma_bands[2];
@@ -71,6 +87,21 @@ static bool battery_calibrated;
 static volatile bool wifi_connected;
 static bool sntp_started;
 static uint32_t station_ipv4;
+static uint32_t wifi_reconnects;
+static uint8_t wifi_last_disconnect_reason;
+static uint8_t wifi_target_visible;
+static uint8_t wifi_target_channel;
+static char wifi_target_ssid[33];
+static bool wifi_manual_scan;
+static i2s_chan_handle_t audio_rx_channel;
+static esp_codec_dev_handle_t audio_record_device;
+static TaskHandle_t recorder_task_handle;
+static SemaphoreHandle_t recorder_lock;
+static SemaphoreHandle_t audio_read_lock;
+static volatile bool recorder_stop_requested;
+static hmi_touch349_recorder_stats_t recorder_stats;
+static char recorder_part_path[160];
+static char recorder_final_path[160];
 static bool initialized;
 
 // Exact external initialization sequence used by the pinned Waveshare V2
@@ -79,6 +110,132 @@ static const axs15231b_lcd_init_cmd_t panel_init_commands[] = {
     {0x11, NULL, 0, 100},
     {0x29, NULL, 0, 100},
 };
+
+static void put_u16_le(uint8_t *destination, uint16_t value) {
+    destination[0] = (uint8_t)value;
+    destination[1] = (uint8_t)(value >> 8);
+}
+
+static void put_u32_le(uint8_t *destination, uint32_t value) {
+    destination[0] = (uint8_t)value;
+    destination[1] = (uint8_t)(value >> 8);
+    destination[2] = (uint8_t)(value >> 16);
+    destination[3] = (uint8_t)(value >> 24);
+}
+
+static void wav_header(uint8_t header[44], uint32_t data_bytes) {
+    memset(header, 0, 44);
+    memcpy(header, "RIFF", 4);
+    put_u32_le(header + 4, 36 + data_bytes);
+    memcpy(header + 8, "WAVEfmt ", 8);
+    put_u32_le(header + 16, 16);
+    put_u16_le(header + 20, 1);
+    put_u16_le(header + 22, AUDIO_CHANNELS);
+    put_u32_le(header + 24, AUDIO_SAMPLE_RATE);
+    put_u32_le(
+        header + 28,
+        AUDIO_SAMPLE_RATE * AUDIO_CHANNELS * AUDIO_BITS / 8
+    );
+    put_u16_le(header + 32, AUDIO_CHANNELS * AUDIO_BITS / 8);
+    put_u16_le(header + 34, AUDIO_BITS);
+    memcpy(header + 36, "data", 4);
+    put_u32_le(header + 40, data_bytes);
+}
+
+static void audio_levels(const int16_t *samples, size_t sample_count, uint32_t *rms, uint32_t *peak) {
+    uint64_t sum_squares = 0;
+    uint32_t maximum = 0;
+    for (size_t index = 0; index < sample_count; ++index) {
+        const int32_t value = samples[index];
+        const uint32_t magnitude = value < 0 ? (uint32_t)-value : (uint32_t)value;
+        maximum = maximum > magnitude ? maximum : magnitude;
+        sum_squares += (uint64_t)value * (uint64_t)value;
+    }
+    const uint32_t mean_square = sample_count == 0 ? 0 : (uint32_t)(sum_squares / sample_count);
+    uint32_t root = mean_square;
+    uint32_t estimate = (root + 1) / 2;
+    while (estimate < root) {
+        root = estimate;
+        estimate = (root + mean_square / root) / 2;
+    }
+    *rms = root;
+    *peak = maximum;
+}
+
+static void recorder_task(void *argument) {
+    (void)argument;
+    FILE *file = fopen(recorder_part_path, "wb+");
+    int32_t error = file == NULL ? ESP_FAIL : ESP_OK;
+    uint64_t data_bytes = 0;
+    uint8_t header[44];
+    wav_header(header, 0);
+    if (file != NULL && fwrite(header, 1, sizeof(header), file) != sizeof(header)) {
+        error = ESP_FAIL;
+    }
+
+    int16_t *samples = heap_caps_malloc(2048, MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT);
+    if (samples == NULL) {
+        error = ESP_ERR_NO_MEM;
+    }
+    while (error == ESP_OK && !recorder_stop_requested) {
+        xSemaphoreTake(audio_read_lock, portMAX_DELAY);
+        const int read_result = esp_codec_dev_read(audio_record_device, samples, 2048);
+        xSemaphoreGive(audio_read_lock);
+        if (read_result != ESP_CODEC_DEV_OK) {
+            ESP_LOGE(TAG, "RECORDER audio read failed: %d", read_result);
+            error = ESP_FAIL;
+            break;
+        }
+        if (fwrite(samples, 1, 2048, file) != 2048) {
+            error = ESP_FAIL;
+            break;
+        }
+        data_bytes += 2048;
+        uint32_t root = 0;
+        uint32_t peak = 0;
+        audio_levels(samples, 2048 / sizeof(int16_t), &root, &peak);
+        xSemaphoreTake(recorder_lock, portMAX_DELAY);
+        recorder_stats.bytes_written = data_bytes;
+        recorder_stats.rms = root;
+        recorder_stats.peak = peak;
+        xSemaphoreGive(recorder_lock);
+    }
+
+    if (file != NULL) {
+        wav_header(header, (uint32_t)data_bytes);
+        if (fseek(file, 0, SEEK_SET) != 0 ||
+            fwrite(header, 1, sizeof(header), file) != sizeof(header) ||
+            fflush(file) != 0 || fsync(fileno(file)) != 0) {
+            error = ESP_FAIL;
+        }
+        if (fclose(file) != 0) {
+            error = ESP_FAIL;
+        }
+    }
+    if (samples != NULL) {
+        free(samples);
+    }
+    if (error == ESP_OK) {
+        if (rename(recorder_part_path, recorder_final_path) != 0) {
+            error = ESP_FAIL;
+        }
+    } else {
+        unlink(recorder_part_path);
+    }
+    xSemaphoreTake(recorder_lock, portMAX_DELAY);
+    recorder_stats.last_error = error;
+    recorder_stats.recording = 0;
+    recorder_task_handle = NULL;
+    xSemaphoreGive(recorder_lock);
+    ESP_LOGI(
+        TAG,
+        "RECORDER STOP file=%s bytes=%llu result=%ld",
+        recorder_final_path,
+        (unsigned long long)data_bytes,
+        (long)error
+    );
+    vTaskDelete(NULL);
+}
 
 static bool transfer_complete(
     esp_lcd_panel_io_handle_t panel_io,
@@ -102,11 +259,14 @@ static esp_err_t init_expander(void) {
         .glitch_ignore_cnt = 7,
         .flags.enable_internal_pullup = true,
     };
-    i2c_master_bus_handle_t bus = NULL;
-    ESP_RETURN_ON_ERROR(i2c_new_master_bus(&bus_config, &bus), TAG, "system I2C");
+    ESP_RETURN_ON_ERROR(
+        i2c_new_master_bus(&bus_config, &system_i2c_bus),
+        TAG,
+        "system I2C"
+    );
     ESP_RETURN_ON_ERROR(
         esp_io_expander_new_i2c_tca9554(
-            bus,
+            system_i2c_bus,
             ESP_IO_EXPANDER_I2C_TCA9554_ADDRESS_000,
             &expander
         ),
@@ -140,6 +300,119 @@ static esp_err_t init_expander(void) {
         "backlight disabled"
     );
     return esp_io_expander_set_level(expander, EXIO_LCD_RESET, 1);
+}
+
+static esp_err_t init_audio_input(void) {
+    i2s_chan_config_t channel_config =
+        I2S_CHANNEL_DEFAULT_CONFIG(I2S_NUM_AUTO, I2S_ROLE_MASTER);
+    channel_config.auto_clear = true;
+    ESP_RETURN_ON_ERROR(
+        i2s_new_channel(&channel_config, NULL, &audio_rx_channel),
+        TAG,
+        "audio RX channel"
+    );
+    const i2s_tdm_slot_mask_t slots =
+        I2S_TDM_SLOT0 | I2S_TDM_SLOT1 | I2S_TDM_SLOT2 | I2S_TDM_SLOT3;
+    i2s_tdm_config_t tdm_config = {
+        .clk_cfg = I2S_TDM_CLK_DEFAULT_CONFIG(AUDIO_SAMPLE_RATE),
+        .slot_cfg = I2S_TDM_PHILIPS_SLOT_DEFAULT_CONFIG(
+            I2S_DATA_BIT_WIDTH_32BIT,
+            I2S_SLOT_MODE_STEREO,
+            slots
+        ),
+        .gpio_cfg = {
+            .mclk = AUDIO_MCLK,
+            .bclk = AUDIO_BCLK,
+            .ws = AUDIO_WS,
+            .dout = I2S_GPIO_UNUSED,
+            .din = AUDIO_DIN,
+            .invert_flags = {
+                .mclk_inv = false,
+                .bclk_inv = false,
+                .ws_inv = false,
+            },
+        },
+    };
+    tdm_config.slot_cfg.total_slot = 4;
+    ESP_RETURN_ON_ERROR(
+        i2s_channel_init_tdm_mode(audio_rx_channel, &tdm_config),
+        TAG,
+        "audio TDM mode"
+    );
+    ESP_RETURN_ON_ERROR(i2s_channel_enable(audio_rx_channel), TAG, "audio RX enable");
+
+    audio_codec_i2c_cfg_t i2c_config = {
+        .port = I2C_NUM_0,
+        .addr = ES7210_CODEC_DEFAULT_ADDR,
+        .bus_handle = system_i2c_bus,
+    };
+    const audio_codec_ctrl_if_t *control = audio_codec_new_i2c_ctrl(&i2c_config);
+    ESP_RETURN_ON_FALSE(control != NULL, ESP_ERR_NO_MEM, TAG, "ES7210 control");
+    audio_codec_i2s_cfg_t i2s_config = {
+        .port = I2S_NUM_0,
+        .rx_handle = audio_rx_channel,
+        .tx_handle = NULL,
+    };
+    const audio_codec_data_if_t *data = audio_codec_new_i2s_data(&i2s_config);
+    ESP_RETURN_ON_FALSE(data != NULL, ESP_ERR_NO_MEM, TAG, "ES7210 data");
+    es7210_codec_cfg_t codec_config = {
+        .ctrl_if = control,
+        .master_mode = false,
+        .mic_selected = ES7120_SEL_MIC1 | ES7120_SEL_MIC2 |
+            ES7120_SEL_MIC3 | ES7120_SEL_MIC4,
+        .mclk_src = ES7210_MCLK_FROM_PAD,
+        .mclk_div = 256,
+    };
+    const audio_codec_if_t *codec = es7210_codec_new(&codec_config);
+    ESP_RETURN_ON_FALSE(codec != NULL, ESP_FAIL, TAG, "ES7210 codec");
+    esp_codec_dev_cfg_t device_config = {
+        .dev_type = ESP_CODEC_DEV_TYPE_IN,
+        .codec_if = codec,
+        .data_if = data,
+    };
+    audio_record_device = esp_codec_dev_new(&device_config);
+    ESP_RETURN_ON_FALSE(audio_record_device != NULL, ESP_FAIL, TAG, "audio input device");
+    esp_codec_dev_sample_info_t sample_config = {
+        .bits_per_sample = AUDIO_BITS,
+        .channel = AUDIO_CHANNELS,
+        // Match the vendor echo example. A zero mask lets esp_codec_dev choose
+        // the first two stereo slots without creating an invalid 3-slot TDM frame.
+        .channel_mask = 0,
+        .sample_rate = AUDIO_SAMPLE_RATE,
+        .mclk_multiple = 256,
+    };
+    ESP_RETURN_ON_FALSE(
+        esp_codec_dev_open(audio_record_device, &sample_config) == ESP_CODEC_DEV_OK,
+        ESP_FAIL,
+        TAG,
+        "open ES7210 input"
+    );
+    ESP_RETURN_ON_FALSE(
+        esp_codec_dev_set_in_gain(audio_record_device, 30) == ESP_CODEC_DEV_OK,
+        ESP_FAIL,
+        TAG,
+        "ES7210 gain"
+    );
+    recorder_lock = xSemaphoreCreateMutex();
+    audio_read_lock = xSemaphoreCreateMutex();
+    ESP_RETURN_ON_FALSE(
+        recorder_lock != NULL && audio_read_lock != NULL,
+        ESP_ERR_NO_MEM,
+        TAG,
+        "audio locks"
+    );
+    recorder_stats.ready = 1;
+    ESP_LOGI(
+        TAG,
+        "AUDIO READY ES7210 TDM %uHz %uch GPIO mclk=%d bclk=%d ws=%d din=%d",
+        AUDIO_SAMPLE_RATE,
+        AUDIO_CHANNELS,
+        AUDIO_MCLK,
+        AUDIO_BCLK,
+        AUDIO_WS,
+        AUDIO_DIN
+    );
+    return ESP_OK;
 }
 
 static esp_err_t init_backlight(void) {
@@ -215,18 +488,22 @@ static void network_event_handler(
     void *event_data
 ) {
     (void)argument;
-    if (event_base == WIFI_EVENT && event_id == WIFI_EVENT_STA_START) {
-        esp_wifi_connect();
-    } else if (event_base == WIFI_EVENT && event_id == WIFI_EVENT_STA_DISCONNECTED) {
+    if (event_base == WIFI_EVENT && event_id == WIFI_EVENT_STA_DISCONNECTED) {
         const wifi_event_sta_disconnected_t *event = event_data;
         wifi_connected = false;
         station_ipv4 = 0;
+        wifi_last_disconnect_reason = event->reason;
+        wifi_reconnects++;
         ESP_LOGW(TAG, "WIFI DISCONNECTED reason=%u rssi=%d", event->reason, event->rssi);
-        esp_wifi_connect();
+        if (!wifi_manual_scan) {
+            vTaskDelay(pdMS_TO_TICKS(500));
+            esp_wifi_connect();
+        }
     } else if (event_base == IP_EVENT && event_id == IP_EVENT_STA_GOT_IP) {
         const ip_event_got_ip_t *event = event_data;
         station_ipv4 = event->ip_info.ip.addr;
         wifi_connected = true;
+        wifi_last_disconnect_reason = 0;
         ESP_LOGI(TAG, "WIFI READY ip=" IPSTR, IP2STR(&event->ip_info.ip));
         if (!sntp_started) {
             const esp_sntp_config_t sntp_config = ESP_NETIF_SNTP_DEFAULT_CONFIG("pool.ntp.org");
@@ -235,6 +512,68 @@ static void network_event_handler(
             }
         }
     }
+}
+
+static esp_err_t scan_wifi_target(void) {
+    const wifi_scan_config_t scan_config = {
+        .ssid = NULL,
+        .bssid = NULL,
+        .channel = 0,
+        .show_hidden = true,
+        .scan_type = WIFI_SCAN_TYPE_ACTIVE,
+    };
+    ESP_RETURN_ON_ERROR(esp_wifi_scan_start(&scan_config, true), TAG, "Wi-Fi scan");
+    uint16_t count = 0;
+    ESP_RETURN_ON_ERROR(esp_wifi_scan_get_ap_num(&count), TAG, "Wi-Fi scan count");
+    const uint16_t capacity = count > 64 ? 64 : count;
+    wifi_ap_record_t *records = capacity == 0 ? NULL : calloc(capacity, sizeof(*records));
+    ESP_RETURN_ON_FALSE(capacity == 0 || records != NULL, ESP_ERR_NO_MEM, TAG, "Wi-Fi scan records");
+    uint16_t fetched = capacity;
+    esp_err_t error = capacity == 0 ? ESP_OK : esp_wifi_scan_get_ap_records(&fetched, records);
+    uint16_t channel_counts[15] = {0};
+    wifi_target_visible = 0;
+    wifi_target_channel = 0;
+    int8_t target_rssi = -127;
+    wifi_auth_mode_t target_auth = WIFI_AUTH_OPEN;
+    if (error == ESP_OK) {
+        for (uint16_t index = 0; index < fetched; ++index) {
+            const uint8_t channel = records[index].primary;
+            if (channel < 15) {
+                channel_counts[channel]++;
+            }
+            if (strcmp((const char *)records[index].ssid, wifi_target_ssid) == 0 &&
+                (!wifi_target_visible || records[index].rssi > target_rssi)) {
+                wifi_target_visible = 1;
+                wifi_target_channel = channel;
+                target_rssi = records[index].rssi;
+                target_auth = records[index].authmode;
+            }
+            ESP_LOGI(
+                TAG,
+                "WIFI AP ssid=%s channel=%u rssi=%d auth=%u",
+                records[index].ssid,
+                channel,
+                records[index].rssi,
+                records[index].authmode
+            );
+        }
+    }
+    ESP_LOGI(TAG, "WIFI SCAN total=%u inspected=%u", count, fetched);
+    for (uint8_t channel = 1; channel < 15; ++channel) {
+        if (channel_counts[channel] != 0) {
+            ESP_LOGI(TAG, "WIFI SCAN channel=%u aps=%u", channel, channel_counts[channel]);
+        }
+    }
+    ESP_LOGI(
+        TAG,
+        "WIFI TARGET exact=%u channel=%u rssi=%d auth=%u",
+        wifi_target_visible,
+        wifi_target_channel,
+        target_rssi,
+        target_auth
+    );
+    free(records);
+    return error;
 }
 
 static esp_err_t init_power_button(void) {
@@ -331,6 +670,10 @@ int hmi_touch349_init(void) {
     ESP_RETURN_ON_ERROR(init_backlight(), TAG, "backlight PWM");
     ESP_RETURN_ON_ERROR(init_touch(), TAG, "touch controller");
     ESP_RETURN_ON_ERROR(init_battery_adc(), TAG, "battery ADC");
+    const esp_err_t audio_error = init_audio_input();
+    if (audio_error != ESP_OK) {
+        ESP_LOGE(TAG, "AUDIO unavailable: %s", esp_err_to_name(audio_error));
+    }
     ESP_RETURN_ON_ERROR(init_power_button(), TAG, "power button");
 
     transfer_done = xSemaphoreCreateCounting(2, 0);
@@ -359,6 +702,107 @@ int hmi_touch349_init(void) {
     initialized = true;
     ESP_LOGI(TAG, "READY 172x640 QSPI mode3 40MHz RGB565");
     return ESP_OK;
+}
+
+int hmi_touch349_recorder_start(const char *filename) {
+    ESP_RETURN_ON_FALSE(
+        filename != NULL && filename[0] != '\0' && recorder_stats.ready == 1,
+        ESP_ERR_INVALID_STATE,
+        TAG,
+        "recorder unavailable"
+    );
+    ESP_RETURN_ON_FALSE(
+        recorder_task_handle == NULL && recorder_stats.recording == 0,
+        ESP_ERR_INVALID_STATE,
+        TAG,
+        "recorder already active"
+    );
+    const char *base = strrchr(filename, '/');
+    base = base == NULL ? filename : base + 1;
+    ESP_RETURN_ON_FALSE(
+        strchr(base, '/') == NULL && strstr(base, "..") == NULL,
+        ESP_ERR_INVALID_ARG,
+        TAG,
+        "unsafe filename"
+    );
+    snprintf(recorder_final_path, sizeof(recorder_final_path), "%s/%s", SD_MOUNT_POINT, base);
+    // Keep the temporary file inside FAT 8.3 limits. The deployed volume does
+    // not enable long file names.
+    snprintf(recorder_part_path, sizeof(recorder_part_path), "%s/REC.TMP", SD_MOUNT_POINT);
+    recorder_stop_requested = false;
+    xSemaphoreTake(recorder_lock, portMAX_DELAY);
+    recorder_stats.bytes_written = 0;
+    recorder_stats.rms = 0;
+    recorder_stats.peak = 0;
+    recorder_stats.last_error = ESP_OK;
+    recorder_stats.recording = 1;
+    xSemaphoreGive(recorder_lock);
+    const BaseType_t created = xTaskCreatePinnedToCore(
+        recorder_task,
+        "audio_recorder",
+        6144,
+        NULL,
+        8,
+        &recorder_task_handle,
+        1
+    );
+    if (created != pdPASS) {
+        recorder_stats.recording = 0;
+        recorder_task_handle = NULL;
+        return ESP_ERR_NO_MEM;
+    }
+    ESP_LOGI(TAG, "RECORDER START file=%s", recorder_final_path);
+    return ESP_OK;
+}
+
+int hmi_touch349_recorder_stop(void) {
+    ESP_RETURN_ON_FALSE(
+        recorder_stats.recording == 1,
+        ESP_ERR_INVALID_STATE,
+        TAG,
+        "recorder not active"
+    );
+    recorder_stop_requested = true;
+    return ESP_OK;
+}
+
+int hmi_touch349_recorder_stats(hmi_touch349_recorder_stats_t *stats) {
+    ESP_RETURN_ON_FALSE(stats != NULL, ESP_ERR_INVALID_ARG, TAG, "recorder stats");
+    if (recorder_lock == NULL) {
+        *stats = recorder_stats;
+        return ESP_OK;
+    }
+    xSemaphoreTake(recorder_lock, portMAX_DELAY);
+    *stats = recorder_stats;
+    xSemaphoreGive(recorder_lock);
+    return ESP_OK;
+}
+
+int hmi_touch349_audio_read_levels(uint32_t *rms, uint32_t *peak) {
+    ESP_RETURN_ON_FALSE(rms != NULL && peak != NULL, ESP_ERR_INVALID_ARG, TAG, "audio levels");
+    ESP_RETURN_ON_FALSE(
+        audio_record_device != NULL && recorder_stats.ready == 1 && recorder_stats.recording == 0,
+        ESP_ERR_INVALID_STATE,
+        TAG,
+        "audio levels unavailable"
+    );
+    int16_t samples[1024];
+    xSemaphoreTake(audio_read_lock, portMAX_DELAY);
+    const int read_result = esp_codec_dev_read(audio_record_device, samples, sizeof(samples));
+    xSemaphoreGive(audio_read_lock);
+    ESP_RETURN_ON_FALSE(
+        read_result == ESP_CODEC_DEV_OK,
+        ESP_FAIL,
+        TAG,
+        "audio level read"
+    );
+    audio_levels(samples, sizeof(samples) / sizeof(samples[0]), rms, peak);
+    return ESP_OK;
+}
+
+int hmi_touch349_console_read(uint8_t *buffer, size_t capacity) {
+    ESP_RETURN_ON_FALSE(buffer != NULL && capacity > 0, ESP_ERR_INVALID_ARG, TAG, "console buffer");
+    return (int)usb_serial_jtag_ll_read_rxfifo(buffer, (uint32_t)capacity);
 }
 
 uint16_t *hmi_touch349_framebuffer(size_t *pixel_count) {
@@ -558,6 +1002,9 @@ int hmi_touch349_network_start(const char *ssid, const char *password) {
     ESP_RETURN_ON_FALSE(esp_netif_create_default_wifi_sta() != NULL, ESP_FAIL, TAG, "Wi-Fi STA");
     const wifi_init_config_t init_config = WIFI_INIT_CONFIG_DEFAULT();
     ESP_RETURN_ON_ERROR(esp_wifi_init(&init_config), TAG, "Wi-Fi init");
+    // The device is deployed in India. Enable the legal 2.4 GHz channels 1-13
+    // before scanning, including APs that use channel 12 or 13.
+    ESP_RETURN_ON_ERROR(esp_wifi_set_country_code("IN", true), TAG, "Wi-Fi country");
     ESP_RETURN_ON_ERROR(
         esp_event_handler_register(WIFI_EVENT, ESP_EVENT_ANY_ID, network_event_handler, NULL),
         TAG,
@@ -569,6 +1016,7 @@ int hmi_touch349_network_start(const char *ssid, const char *password) {
         "IP event handler"
     );
     wifi_config_t config = {0};
+    strlcpy(wifi_target_ssid, ssid, sizeof(wifi_target_ssid));
     strlcpy((char *)config.sta.ssid, ssid, sizeof(config.sta.ssid));
     strlcpy((char *)config.sta.password, password, sizeof(config.sta.password));
     config.sta.scan_method = WIFI_ALL_CHANNEL_SCAN;
@@ -579,8 +1027,27 @@ int hmi_touch349_network_start(const char *ssid, const char *password) {
     ESP_RETURN_ON_ERROR(esp_wifi_set_config(WIFI_IF_STA, &config), TAG, "Wi-Fi config");
     ESP_RETURN_ON_ERROR(esp_wifi_set_ps(WIFI_PS_NONE), TAG, "Wi-Fi power save");
     ESP_RETURN_ON_ERROR(esp_wifi_start(), TAG, "Wi-Fi start");
+    const esp_err_t scan_error = scan_wifi_target();
+    if (scan_error != ESP_OK) {
+        ESP_LOGW(TAG, "WIFI SCAN failed: %s", esp_err_to_name(scan_error));
+    }
+    ESP_RETURN_ON_ERROR(esp_wifi_connect(), TAG, "Wi-Fi connect");
     ESP_LOGI(TAG, "WIFI START ssid=%s", ssid);
     return ESP_OK;
+}
+
+int hmi_touch349_network_scan(void) {
+    wifi_manual_scan = true;
+    const esp_err_t disconnect_error = esp_wifi_disconnect();
+    if (disconnect_error != ESP_OK && disconnect_error != ESP_ERR_WIFI_NOT_CONNECT) {
+        wifi_manual_scan = false;
+        return disconnect_error;
+    }
+    vTaskDelay(pdMS_TO_TICKS(100));
+    const esp_err_t scan_error = scan_wifi_target();
+    wifi_manual_scan = false;
+    const esp_err_t connect_error = esp_wifi_connect();
+    return scan_error != ESP_OK ? scan_error : connect_error;
 }
 
 int hmi_touch349_network_stats(hmi_touch349_network_stats_t *stats) {
@@ -588,6 +1055,10 @@ int hmi_touch349_network_stats(hmi_touch349_network_stats_t *stats) {
     memset(stats, 0, sizeof(*stats));
     stats->connected = wifi_connected ? 1 : 0;
     stats->ipv4 = station_ipv4;
+    stats->reconnects = wifi_reconnects;
+    stats->last_disconnect_reason = wifi_last_disconnect_reason;
+    stats->target_visible = wifi_target_visible;
+    stats->target_channel = wifi_target_channel;
     time_t now = 0;
     time(&now);
     stats->time_synced = now > 1700000000 ? 1 : 0;

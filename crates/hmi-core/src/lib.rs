@@ -403,7 +403,7 @@ impl Default for DashboardState {
             buttons: [ButtonTelemetry::default(); 2],
             settings_index: 0,
             speaker_volume: 55,
-            display_brightness: 75,
+            display_brightness: 80,
             display_fps: 0,
             event_logging_enabled: false,
             recording: false,
@@ -445,8 +445,15 @@ impl DashboardState {
     /// Apply one released Touch349 tap in native portrait coordinates.
     /// Returns true when the backlight setting changed and must be applied by firmware.
     pub fn apply_touch349(&mut self, x: u16, y: u16, now_ms: u64) -> bool {
+        self.pending_action = None;
+        self.poweroff_prepared = false;
         let mut brightness_changed = false;
         if y >= 568 {
+            if self.view == View::Recorder && self.recording {
+                self.pending_action = Some(UiAction::ToggleRecording);
+            } else if self.view == View::Player {
+                self.pending_action = Some(UiAction::StopPlayback);
+            }
             if x < 86 {
                 self.view = View::Home;
             } else {
@@ -458,9 +465,17 @@ impl DashboardState {
             }
         } else {
             match self.view {
-                View::Home if y >= 214 => {
+                View::Home if (252..468).contains(&y) => {
                     let column = usize::from(x >= 86);
-                    let row = usize::from(y >= 352);
+                    let row = usize::from(y >= 368);
+                    let row_top = if row == 0 { 252 } else { 368 };
+                    if !((8..164).contains(&x)
+                        && (row_top..row_top + 100).contains(&y)
+                        && !((84..88).contains(&x)))
+                    {
+                        self.record(now_ms, "TOUCH", format!("x={x} y={y}"));
+                        return false;
+                    }
                     self.menu_index = (row * 2 + column) as u8;
                     self.view = match self.menu_index {
                         0 => View::Recorder,
@@ -496,19 +511,30 @@ impl DashboardState {
                         self.event_offset = 0;
                     }
                 },
-                View::Recorder if y >= 448 => self.pending_action = Some(UiAction::ToggleRecording),
+                View::Recorder if (8..164).contains(&x) && (448..504).contains(&y) => {
+                    self.pending_action = Some(UiAction::ToggleRecording)
+                }
                 View::Files => {
                     if self.files.is_empty() {
-                        self.pending_action = Some(UiAction::RefreshFiles);
+                        if (8..164).contains(&x) && (448..504).contains(&y) {
+                            self.pending_action = Some(UiAction::RefreshFiles);
+                        }
                     } else if (68..500).contains(&y) {
-                        let start = self.file_index.saturating_sub(3);
-                        self.file_index = (start + usize::from((y - 68) / 72))
-                            .min(self.files.len().saturating_sub(1));
-                        self.pending_action = Some(UiAction::OpenSelectedFile);
+                        let row = usize::from((y - 68) / 72);
+                        let row_top = 68 + row as u16 * 72;
+                        if (8..164).contains(&x) && (row_top..row_top + 60).contains(&y) {
+                            let start = self.file_index.saturating_sub(3);
+                            self.file_index = (start + row).min(self.files.len().saturating_sub(1));
+                            self.pending_action = Some(UiAction::OpenSelectedFile);
+                        }
                     }
                 }
-                View::Player if y >= 448 => self.pending_action = Some(UiAction::TogglePlayback),
-                View::Live if y >= 500 => self.view = View::Recorder,
+                View::Player if (8..164).contains(&x) && (458..514).contains(&y) => {
+                    self.pending_action = Some(UiAction::TogglePlayback)
+                }
+                View::Live if (8..164).contains(&x) && (508..564).contains(&y) => {
+                    self.view = View::Recorder
+                }
                 View::Viewer if y >= 130 => self.pending_action = Some(UiAction::ViewerNext),
                 _ => {}
             }
@@ -1748,11 +1774,17 @@ fn touch_recorder<D: DrawTarget<Color = Rgb565>>(
         70,
         if state.recording {
             "RECORDING"
+        } else if !state.storage.mounted {
+            "SD NOT READY"
+        } else if state.audio.health != Health::Ok {
+            "MIC NOT READY"
         } else {
             "READY"
         },
         if state.recording {
             TOUCH_ERROR
+        } else if !state.storage.mounted || state.audio.health != Health::Ok {
+            TOUCH_WARN
         } else {
             TOUCH_OK
         },
@@ -1792,7 +1824,14 @@ fn touch_files<D: DrawTarget<Color = Rgb565>>(
     state: &DashboardState,
 ) -> Result<(), D::Error> {
     if state.files.is_empty() {
-        touch_text(display, "NO FILES", 48, 260, TOUCH_MUTED, true)?;
+        let status = if !state.storage.mounted {
+            "SD NOT MOUNTED"
+        } else if state.storage.health == Health::Error {
+            "SD SCAN ERROR"
+        } else {
+            "SD IS EMPTY"
+        };
+        touch_text(display, status, 28, 260, TOUCH_MUTED, true)?;
         return touch_action(display, 8, 448, "RESCAN SD", TOUCH_ACCENT);
     }
     let start = state.file_index.saturating_sub(3);
@@ -1923,6 +1962,10 @@ fn touch_live<D: DrawTarget<Color = Rgb565>>(
     display: &mut D,
     state: &DashboardState,
 ) -> Result<(), D::Error> {
+    if state.audio.health != Health::Ok {
+        touch_text(display, "MIC NOT READY", 30, 260, TOUCH_WARN, true)?;
+        return touch_action(display, 8, 508, "OPEN RECORDER", TOUCH_ERROR);
+    }
     touch_waveform(display, &state.audio, 8, 72, 156, 330, TOUCH_ACCENT)?;
     touch_text(
         display,
@@ -1998,7 +2041,10 @@ fn touch_settings<D: DrawTarget<Color = Rgb565>>(
     state: &DashboardState,
 ) -> Result<(), D::Error> {
     let values = [
-        ("BRIGHTNESS", format!("{}%", state.display_brightness)),
+        (
+            "BRIGHTNESS",
+            format!("{}%", state.display_brightness.max(20)),
+        ),
         ("REFRESH MODE", "MAX / ON DEMAND".into()),
         ("REDRAW SCREEN", "TAP TO RUN".into()),
         ("CLEAR NOTICES", "TAP TO RUN".into()),
@@ -2221,6 +2267,21 @@ mod tests {
         assert!(!state.apply_touch349(40, 190, 20));
         assert_eq!(state.display_fps, 0);
         assert_eq!(state.take_action(), Some(UiAction::RefreshDisplay));
+    }
+
+    #[test]
+    fn touch349_brightness_never_goes_below_twenty_percent() {
+        let mut state = DashboardState {
+            view: View::Settings,
+            ..DashboardState::default()
+        };
+        let mut values = Vec::new();
+        for now_ms in 1..=8 {
+            assert!(state.apply_touch349(40, 100, now_ms));
+            values.push(state.display_brightness);
+            assert!(state.display_brightness >= 20);
+        }
+        assert_eq!(values, [100, 20, 50, 80, 100, 20, 50, 80]);
     }
 
     #[test]

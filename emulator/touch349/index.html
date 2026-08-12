@@ -241,6 +241,7 @@
         try{
           clearTimers(); state=baseState(); scenarios.healthy.apply(state); render();
           assert(screen.clientWidth===172&&screen.clientHeight===640,`native viewport was ${screen.clientWidth}x${screen.clientHeight}`); checks.push("native-172x640");
+          state.brightness=0;render();assert(state.brightness===20,"brightness dropped below 20 percent");checks.push("brightness-floor");
           assert(screen.textContent.includes("READY TO CAPTURE"),"healthy home did not render"); checks.push("healthy-home");
           go("recorder"); action("arm-record"); assert(state.recorder==="armed","recorder did not arm"); finishHold("start-record"); assert(state.recorder==="recording","recorder did not start"); checks.push("record-start");
           state.recordSeconds=9; state.recordBytes=864044; finishHold("stop-record"); await sleep(950); assert(state.recorder==="idle"&&state.files[0].duration===9,"recording did not finalize into files"); checks.push("record-save");

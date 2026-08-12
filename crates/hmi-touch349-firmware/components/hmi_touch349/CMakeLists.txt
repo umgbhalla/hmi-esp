@@ -1,5 +1,5 @@
 idf_component_register(
     SRCS "hmi_touch349.c"
     INCLUDE_DIRS "include"
-    REQUIRES esp_lcd_axs15231b esp_io_expander_tca9554 esp_driver_gpio esp_driver_i2c esp_driver_spi esp_driver_ledc esp_hw_support esp_timer fatfs sdmmc esp_wifi esp_event esp_netif nvs_flash lwip esp_adc
+    REQUIRES esp_lcd_axs15231b esp_io_expander_tca9554 esp_codec_dev esp_driver_gpio esp_driver_i2c esp_driver_i2s esp_driver_spi esp_driver_ledc esp_hw_support esp_timer fatfs sdmmc esp_wifi esp_event esp_netif nvs_flash lwip esp_adc hal
 )
