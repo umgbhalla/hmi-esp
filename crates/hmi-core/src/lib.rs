@@ -123,6 +123,15 @@ pub enum UiAction {
     PreparePoweroff,
 }
 
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub enum SpeakerTestState {
+    #[default]
+    Idle,
+    Running,
+    PassedToCodec,
+    Error,
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum FileKind {
     Wav,
@@ -352,6 +361,7 @@ pub struct DashboardState {
     pub buttons: [ButtonTelemetry; 2],
     pub settings_index: u8,
     pub speaker_volume: u8,
+    pub speaker_test_state: SpeakerTestState,
     pub display_brightness: u8,
     pub display_fps: u8,
     pub event_logging_enabled: bool,
@@ -396,6 +406,7 @@ impl Default for DashboardState {
             buttons: [ButtonTelemetry::default(); 2],
             settings_index: 0,
             speaker_volume: 55,
+            speaker_test_state: SpeakerTestState::Idle,
             display_brightness: 80,
             display_fps: 0,
             event_logging_enabled: false,
@@ -499,10 +510,7 @@ impl DashboardState {
                     }
                     1 => self.pending_action = Some(UiAction::RefreshDisplay),
                     2 => self.pending_action = Some(UiAction::RefreshDisplay),
-                    _ => {
-                        self.events.clear();
-                        self.event_offset = 0;
-                    }
+                    _ => self.view = View::Diagnostics,
                 },
                 View::Recorder if (8..164).contains(&x) && (448..504).contains(&y) => {
                     self.pending_action = Some(UiAction::ToggleRecording)
@@ -524,6 +532,9 @@ impl DashboardState {
                 }
                 View::Player if (8..164).contains(&x) && (458..514).contains(&y) => {
                     self.pending_action = Some(UiAction::TogglePlayback)
+                }
+                View::Diagnostics if (8..164).contains(&x) && (488..544).contains(&y) => {
+                    self.pending_action = Some(UiAction::SpeakerTest)
                 }
                 View::Live if (8..164).contains(&x) && (508..564).contains(&y) => {
                     self.view = View::Recorder
@@ -2010,11 +2021,25 @@ fn touch_diagnostics<D: DrawTarget<Color = Rgb565>>(
         display,
         &format!("LCD {}ms", state.runtime.display_flush_ms),
         12,
-        446,
+        444,
         TOUCH_TEXT,
         false,
     )?;
-    Ok(())
+    touch_text(
+        display,
+        "EXTERNAL SPEAKER REQUIRED",
+        12,
+        466,
+        TOUCH_WARN,
+        false,
+    )?;
+    let (label, color) = match state.speaker_test_state {
+        SpeakerTestState::Idle => ("PLAY SPEAKER TEST", TOUCH_ACCENT),
+        SpeakerTestState::Running => ("PLAYING BEEPS", TOUCH_WARN),
+        SpeakerTestState::PassedToCodec => ("SIGNAL SENT - TEST AGAIN", TOUCH_OK),
+        SpeakerTestState::Error => ("SPEAKER ERROR - RETRY", TOUCH_ERROR),
+    };
+    touch_action(display, 8, 488, label, color)
 }
 
 fn touch_settings<D: DrawTarget<Color = Rgb565>>(
@@ -2028,7 +2053,7 @@ fn touch_settings<D: DrawTarget<Color = Rgb565>>(
         ),
         ("REFRESH MODE", "MAX / ON DEMAND".into()),
         ("REDRAW SCREEN", "TAP TO RUN".into()),
-        ("CLEAR NOTICES", "TAP TO RUN".into()),
+        ("AUDIO DIAGNOSTICS", "TAP TO OPEN".into()),
     ];
     for (index, (label, value)) in values.iter().enumerate() {
         let y = 72 + index as i32 * 96;
@@ -2263,6 +2288,18 @@ mod tests {
             assert!(state.display_brightness >= 20);
         }
         assert_eq!(values, [100, 20, 50, 80, 100, 20, 50, 80]);
+    }
+
+    #[test]
+    fn touch349_speaker_test_has_a_direct_touch_path() {
+        let mut state = DashboardState {
+            view: View::Settings,
+            ..DashboardState::default()
+        };
+        assert!(!state.apply_touch349(80, 400, 10));
+        assert_eq!(state.view, View::Diagnostics);
+        assert!(!state.apply_touch349(80, 515, 20));
+        assert_eq!(state.take_action(), Some(UiAction::SpeakerTest));
     }
 
     #[test]

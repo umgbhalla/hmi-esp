@@ -31,7 +31,8 @@ mod firmware {
     };
     use hmi_core::{
         decode_touch349_packet, render_touch349_dashboard, BatteryTelemetry, DashboardState,
-        FileEntry, FileKind, Health, StorageTelemetry, Touch349FrameBuffer, UiAction, View,
+        FileEntry, FileKind, Health, SpeakerTestState, StorageTelemetry, Touch349FrameBuffer,
+        UiAction, View,
     };
 
     const PIXELS: usize = hmi_core::TOUCH349_PIXELS;
@@ -53,6 +54,49 @@ mod firmware {
         data_start: u64,
         data_len: u64,
         position: u64,
+    }
+
+    struct SpeakerTest {
+        block_index: u16,
+        next_block_at: Instant,
+    }
+
+    impl SpeakerTest {
+        const BLOCKS: u16 = 163;
+        const SINE: [i16; 32] = [
+            0, 4292, 8426, 12_248, 15_600, 18_353, 20_400, 21_661, 22_000, 21_661, 20_400, 18_353,
+            15_600, 12_248, 8426, 4292, 0, -4292, -8426, -12_248, -15_600, -18_353, -20_400,
+            -21_661, -22_000, -21_661, -20_400, -18_353, -15_600, -12_248, -8426, -4292,
+        ];
+
+        fn new() -> Self {
+            Self {
+                block_index: 0,
+                next_block_at: Instant::now(),
+            }
+        }
+
+        fn fill_block(&self, output: &mut [i16; 1024]) {
+            // Audible signature at 24 kHz:
+            // 750 short, 750 short, 1500 long, 3000 short x3.
+            // The exact tones and silent gaps are easy to detect over room noise.
+            let phase_step = match self.block_index {
+                0..=17 | 25..=42 => 1,
+                50..=84 => 2,
+                95..=112 | 120..=137 | 145..=162 => 4,
+                _ => 0,
+            };
+            for frame in 0..512 {
+                let sample = if phase_step == 0 {
+                    0
+                } else {
+                    let sample_index = usize::from(self.block_index) * 512 + frame;
+                    Self::SINE[(sample_index * phase_step) % Self::SINE.len()]
+                };
+                output[frame * 2] = sample;
+                output[frame * 2 + 1] = sample;
+            }
+        }
     }
 
     impl WavPlayer {
@@ -350,6 +394,7 @@ mod firmware {
         now_ms: u64,
         recording_stop_pending: &mut bool,
         player: &mut Option<WavPlayer>,
+        speaker_test: &mut Option<SpeakerTest>,
     ) -> anyhow::Result<()> {
         match action {
             UiAction::RefreshFiles => refresh_storage(state, sd),
@@ -364,6 +409,7 @@ mod firmware {
                 ensure!(state.storage.mounted, "SD card is not mounted");
                 ensure!(state.audio.health == Health::Ok, "microphone is not ready");
                 *player = None;
+                *speaker_test = None;
                 state.playing = false;
                 let name = next_recording_name(state, now_ms);
                 let c_name = CString::new(name.as_str()).expect("generated name contains NUL");
@@ -455,7 +501,26 @@ mod firmware {
                 ensure!(result == 0, "speaker volume failed: {result}");
                 Ok(())
             }
-            UiAction::SpeakerTest => Err(anyhow!("speaker test is not exposed on this screen")),
+            UiAction::SpeakerTest => {
+                ensure!(!state.recording, "stop recording before the speaker test");
+                ensure!(
+                    unsafe { hmi_touch349_audio_output_ready() } == 1,
+                    "speaker output is not ready"
+                );
+                state.playing = false;
+                unsafe { hmi_touch349_audio_stop(std::ptr::null_mut()) };
+                let volume_result = unsafe { hmi_touch349_audio_volume_set(100) };
+                ensure!(volume_result == 0, "speaker volume failed: {volume_result}");
+                state.speaker_volume = 100;
+                state.speaker_test_state = SpeakerTestState::Running;
+                *speaker_test = Some(SpeakerTest::new());
+                state.record(
+                    now_ms,
+                    "AUDIO",
+                    "speaker test started: 750x2-1500-3000x3 Hz",
+                );
+                Ok(())
+            }
             UiAction::ToggleEventLog => {
                 state.event_logging_enabled = !state.event_logging_enabled;
                 Ok(())
@@ -539,6 +604,46 @@ mod firmware {
                 true
             }
         }
+    }
+
+    fn service_speaker_test(
+        test: &mut Option<SpeakerTest>,
+        state: &mut DashboardState,
+        now_ms: u64,
+    ) -> bool {
+        let Some(active) = test.as_mut() else {
+            return false;
+        };
+        if active.block_index >= SpeakerTest::BLOCKS {
+            if unsafe { hmi_touch349_audio_pending() } != 0 {
+                return false;
+            }
+            *test = None;
+            state.speaker_test_state = SpeakerTestState::PassedToCodec;
+            state.record(now_ms, "AUDIO", "speaker test blocks accepted by codec");
+            println!("SPEAKER TEST COMPLETE result=codec-accepted audible=unverified");
+            return true;
+        }
+        if Instant::now() < active.next_block_at {
+            return false;
+        }
+        let mut samples = [0i16; 1024];
+        active.fill_block(&mut samples);
+        let result = unsafe { hmi_touch349_audio_write(samples.as_ptr(), samples.len()) };
+        if result != 0 {
+            *test = None;
+            state.speaker_test_state = SpeakerTestState::Error;
+            state.record(
+                now_ms,
+                "AUDIO",
+                format!("speaker test write failed {result}"),
+            );
+            println!("SPEAKER TEST ERROR write={result}");
+            return true;
+        }
+        active.block_index += 1;
+        active.next_block_at += Duration::from_micros(21_333);
+        false
     }
 
     fn poll_recorder(
@@ -636,6 +741,7 @@ mod firmware {
         now_ms: u64,
         recording_stop_pending: &mut bool,
         player: &mut Option<WavPlayer>,
+        speaker_test: &mut Option<SpeakerTest>,
         pending_delete: &mut Option<(String, u64)>,
     ) -> bool {
         let command = command.trim();
@@ -646,7 +752,7 @@ mod firmware {
         let result = (|| -> anyhow::Result<()> {
             match command {
                 "help" => {
-                    println!("CMD commands=help,status,wifi scan,sd scan,files,file stat NAME,file read NAME,file delete prepare NAME,file delete confirm NAME,play open NAME,play start,play stop,play close,record start,record stop");
+                    println!("CMD commands=help,status,speaker test,wifi scan,sd scan,files,file stat NAME,file read NAME,file delete prepare NAME,file delete confirm NAME,play open NAME,play start,play stop,play close,record start,record stop");
                     Ok(())
                 }
                 "status" => {
@@ -697,6 +803,15 @@ mod firmware {
                     }
                     Ok(())
                 }
+                "speaker test" => handle_action(
+                    UiAction::SpeakerTest,
+                    state,
+                    sd,
+                    now_ms,
+                    recording_stop_pending,
+                    player,
+                    speaker_test,
+                ),
                 "play start" => handle_action(
                     UiAction::TogglePlayback,
                     state,
@@ -704,6 +819,7 @@ mod firmware {
                     now_ms,
                     recording_stop_pending,
                     player,
+                    speaker_test,
                 ),
                 "play stop" => {
                     ensure!(state.playing || player.is_some(), "no WAV file is open");
@@ -714,6 +830,7 @@ mod firmware {
                         now_ms,
                         recording_stop_pending,
                         player,
+                        speaker_test,
                     )
                 }
                 "play close" => {
@@ -733,6 +850,7 @@ mod firmware {
                     now_ms,
                     recording_stop_pending,
                     player,
+                    speaker_test,
                 ),
                 "record stop" => {
                     ensure!(state.recording, "recorder is not active");
@@ -743,6 +861,7 @@ mod firmware {
                         now_ms,
                         recording_stop_pending,
                         player,
+                        speaker_test,
                     )
                 }
                 _ if command.starts_with("file stat ") => {
@@ -857,6 +976,7 @@ mod firmware {
         now_ms: u64,
         recording_stop_pending: &mut bool,
         player: &mut Option<WavPlayer>,
+        speaker_test: &mut Option<SpeakerTest>,
         pending_delete: &mut Option<(String, u64)>,
     ) -> bool {
         let mut input = [0u8; 64];
@@ -877,6 +997,7 @@ mod firmware {
                             now_ms,
                             recording_stop_pending,
                             player,
+                            speaker_test,
                             pending_delete,
                         );
                         line.clear();
@@ -1035,6 +1156,7 @@ mod firmware {
         let mut recorder_refresh = Instant::now() - Duration::from_secs(1);
         let mut recording_stop_pending = false;
         let mut player: Option<WavPlayer> = None;
+        let mut speaker_test: Option<SpeakerTest> = None;
         let mut pending_delete: Option<(String, u64)> = None;
         let mut console_line = String::new();
         let mut network = hmi_touch349_network_stats_t {
@@ -1058,6 +1180,7 @@ mod firmware {
                 now_ms,
                 &mut recording_stop_pending,
                 &mut player,
+                &mut speaker_test,
                 &mut pending_delete,
             );
             let power_pressed = unsafe { hmi_touch349_power_button_pressed() };
@@ -1081,7 +1204,15 @@ mod firmware {
             }
 
             let mut response = [0u8; 32];
-            let touch_result = unsafe { hmi_touch349_touch_read(response.as_mut_ptr()) };
+            // The touch controller can time out while the audio clocks are
+            // active. The speaker test has no cancel action, so pause touch I2C
+            // for its short duration and keep the serial log free of false
+            // hardware errors.
+            let touch_result = if speaker_test.is_some() {
+                -1
+            } else {
+                unsafe { hmi_touch349_touch_read(response.as_mut_ptr()) }
+            };
             if touch_result == 0 {
                 if let Some(point) = decode_touch349_packet(&response) {
                     last_touch = Some(point);
@@ -1112,6 +1243,7 @@ mod firmware {
                                 now_ms,
                                 &mut recording_stop_pending,
                                 &mut player,
+                                &mut speaker_test,
                             ) {
                                 println!("ACTION ERROR action={action:?} error={error:#}");
                                 state.record(now_ms, "ACTION", format!("{action:?}: {error}"));
@@ -1127,8 +1259,9 @@ mod firmware {
 
             state.runtime.uptime_ms = now_ms;
             redraw |= service_playback(&mut player, &mut state);
+            redraw |= service_speaker_test(&mut speaker_test, &mut state, now_ms);
             if recorder_refresh.elapsed() >= Duration::from_millis(100) {
-                if !state.playing {
+                if !state.playing && speaker_test.is_none() {
                     redraw |=
                         poll_recorder(&mut state, &mut sd, now_ms, &mut recording_stop_pending);
                 }
@@ -1166,9 +1299,10 @@ mod firmware {
                 );
                 heartbeat = Instant::now();
             }
-            if !state.playing {
-                thread::sleep(TOUCH_POLL);
-            }
+            // Keep touch polling at a fixed rate during playback. Removing this
+            // delay floods the AXS15231B touch I2C bus and produces repeated
+            // software timeouts while the independent I2S audio task is active.
+            thread::sleep(TOUCH_POLL);
         }
     }
 }
