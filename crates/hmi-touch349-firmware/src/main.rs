@@ -411,6 +411,7 @@ mod firmware {
                 *player = None;
                 *speaker_test = None;
                 state.playing = false;
+                unsafe { hmi_touch349_audio_stop(std::ptr::null_mut()) };
                 let name = next_recording_name(state, now_ms);
                 let c_name = CString::new(name.as_str()).expect("generated name contains NUL");
                 let result = unsafe { hmi_touch349_recorder_start(c_name.as_ptr()) };
@@ -434,6 +435,36 @@ mod firmware {
                     .cloned()
                     .ok_or_else(|| anyhow!("last recording is not on the SD card"))?;
                 open_media_entry(entry, state, player)
+            }
+            UiAction::ToggleLastRecording => {
+                ensure!(!state.recording, "stop recording before playback");
+                if state.playing {
+                    state.playing = false;
+                    unsafe { hmi_touch349_audio_stop(std::ptr::null_mut()) };
+                    if let Some(player) = player.as_mut() {
+                        player.rewind()?;
+                    }
+                    state.playback_position_ms = 0;
+                    return Ok(());
+                }
+                ensure!(
+                    !state.last_recording.is_empty(),
+                    "no recording is available"
+                );
+                let entry = state
+                    .files
+                    .iter()
+                    .find(|entry| entry.name == state.last_recording)
+                    .cloned()
+                    .ok_or_else(|| anyhow!("last recording is not on the SD card"))?;
+                let opened = WavPlayer::open(&entry)?;
+                state.playback_duration_ms = opened.duration_ms();
+                state.playback_position_ms = 0;
+                state.playback_name = entry.name;
+                state.playback_audio = Default::default();
+                state.playing = true;
+                *player = Some(opened);
+                Ok(())
             }
             UiAction::OpenSelectedFile => {
                 let entry = state

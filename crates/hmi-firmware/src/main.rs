@@ -674,6 +674,15 @@ mod firmware {
                         self.open_player(&name, state)?;
                     }
                 }
+                UiAction::ToggleLastRecording => {
+                    if state.playing {
+                        self.stop_playback(state)?;
+                    } else if !state.last_recording.is_empty() {
+                        let name = state.last_recording.clone();
+                        self.open_player(&name, state)?;
+                        state.playing = true;
+                    }
+                }
                 UiAction::OpenSelectedFile => {
                     if let Some(entry) = state.selected_file().cloned() {
                         match entry.kind {

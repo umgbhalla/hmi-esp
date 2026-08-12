@@ -111,6 +111,7 @@ pub enum UiAction {
     RefreshFiles,
     ToggleRecording,
     OpenLastRecording,
+    ToggleLastRecording,
     OpenSelectedFile,
     TogglePlayback,
     StopPlayback,
@@ -512,8 +513,18 @@ impl DashboardState {
                     2 => self.pending_action = Some(UiAction::RefreshDisplay),
                     _ => self.view = View::Diagnostics,
                 },
-                View::Recorder if (8..164).contains(&x) && (448..504).contains(&y) => {
-                    self.pending_action = Some(UiAction::ToggleRecording)
+                View::Recorder if (8..164).contains(&x) => {
+                    if self.recording && (448..504).contains(&y) {
+                        self.pending_action = Some(UiAction::ToggleRecording);
+                    } else if !self.recording && !self.last_recording.is_empty() {
+                        if (416..472).contains(&y) {
+                            self.pending_action = Some(UiAction::ToggleLastRecording);
+                        } else if (488..544).contains(&y) {
+                            self.pending_action = Some(UiAction::ToggleRecording);
+                        }
+                    } else if (448..504).contains(&y) {
+                        self.pending_action = Some(UiAction::ToggleRecording);
+                    }
                 }
                 View::Files => {
                     if self.files.is_empty() {
@@ -1766,6 +1777,8 @@ fn touch_recorder<D: DrawTarget<Color = Rgb565>>(
         70,
         if state.recording {
             "RECORDING"
+        } else if state.playing {
+            "PLAYING LAST"
         } else if !state.storage.mounted {
             "SD NOT READY"
         } else if state.audio.health != Health::Ok {
@@ -1781,34 +1794,75 @@ fn touch_recorder<D: DrawTarget<Color = Rgb565>>(
             TOUCH_OK
         },
     )?;
-    touch_waveform(display, &state.audio, 8, 124, 156, 220, TOUCH_ACCENT)?;
+    touch_waveform(
+        display,
+        if state.playing {
+            &state.playback_audio
+        } else {
+            &state.audio
+        },
+        8,
+        124,
+        156,
+        200,
+        TOUCH_ACCENT,
+    )?;
     touch_text(
         display,
         "24 kHz / stereo / WAV",
         13,
-        360,
+        338,
         TOUCH_MUTED,
         false,
     )?;
-    touch_text(
-        display,
-        &format!("{} KiB", state.recording_bytes / 1024),
-        13,
-        388,
-        TOUCH_TEXT,
-        true,
-    )?;
-    touch_action(
-        display,
-        8,
-        448,
-        if state.recording {
-            "STOP"
-        } else {
-            "START RECORDING"
-        },
-        TOUCH_ERROR,
-    )
+    let recorder_detail = if state.playing {
+        format!(
+            "{:02}:{:02} / {:02}:{:02}",
+            state.playback_position_ms / 60_000,
+            state.playback_position_ms / 1_000 % 60,
+            state.playback_duration_ms / 60_000,
+            state.playback_duration_ms / 1_000 % 60,
+        )
+    } else {
+        format!("{} KiB", state.recording_bytes / 1024)
+    };
+    touch_text(display, &recorder_detail, 13, 364, TOUCH_TEXT, true)?;
+    if !state.last_recording.is_empty() {
+        touch_text(
+            display,
+            &clipped_name(&state.last_recording, 24),
+            13,
+            390,
+            TOUCH_MUTED,
+            false,
+        )?;
+    }
+    if state.recording || state.last_recording.is_empty() {
+        touch_action(
+            display,
+            8,
+            448,
+            if state.recording {
+                "STOP"
+            } else {
+                "START RECORDING"
+            },
+            TOUCH_ERROR,
+        )
+    } else {
+        touch_action(
+            display,
+            8,
+            416,
+            if state.playing {
+                "STOP PLAYBACK"
+            } else {
+                "PLAY LAST RECORDING"
+            },
+            TOUCH_ACCENT,
+        )?;
+        touch_action(display, 8, 488, "START RECORDING", TOUCH_ERROR)
+    }
 }
 
 fn touch_files<D: DrawTarget<Color = Rgb565>>(
@@ -2300,6 +2354,27 @@ mod tests {
         assert_eq!(state.view, View::Diagnostics);
         assert!(!state.apply_touch349(80, 515, 20));
         assert_eq!(state.take_action(), Some(UiAction::SpeakerTest));
+    }
+
+    #[test]
+    fn touch349_recorder_can_play_and_stop_the_last_recording_in_place() {
+        let mut state = DashboardState {
+            view: View::Recorder,
+            last_recording: "R000001.WAV".into(),
+            ..DashboardState::default()
+        };
+        assert!(!state.apply_touch349(80, 440, 10));
+        assert_eq!(state.view, View::Recorder);
+        assert_eq!(state.take_action(), Some(UiAction::ToggleLastRecording));
+
+        state.playing = true;
+        assert!(!state.apply_touch349(80, 440, 20));
+        assert_eq!(state.view, View::Recorder);
+        assert_eq!(state.take_action(), Some(UiAction::ToggleLastRecording));
+
+        state.playing = false;
+        assert!(!state.apply_touch349(80, 515, 30));
+        assert_eq!(state.take_action(), Some(UiAction::ToggleRecording));
     }
 
     #[test]
