@@ -59,6 +59,7 @@
 #define AUDIO_BITS 16
 #define AUDIO_PLAYBACK_SAMPLES 1024
 #define AUDIO_PLAYBACK_QUEUE_DEPTH 4
+#define AUDIO_IDLE_MUTE_MS 80
 
 #define SYSTEM_I2C_SDA GPIO_NUM_47
 #define SYSTEM_I2C_SCL GPIO_NUM_48
@@ -75,6 +76,7 @@
 #define EXIO_BACKLIGHT_ENABLE (1ULL << 1)
 #define EXIO_LCD_RESET (1ULL << 5)
 #define EXIO_SYSTEM_ENABLE (1ULL << 6)
+#define EXIO_NS_MODE (1ULL << 7)
 
 static const char *TAG = "touch349_minimal";
 static esp_lcd_panel_handle_t panel;
@@ -105,6 +107,7 @@ static bool audio_output_open;
 static QueueHandle_t audio_playback_queue;
 static TaskHandle_t audio_playback_task_handle;
 static volatile bool audio_output_busy;
+static volatile bool audio_amplifier_enabled;
 static TaskHandle_t recorder_task_handle;
 static SemaphoreHandle_t recorder_lock;
 static SemaphoreHandle_t audio_read_lock;
@@ -123,8 +126,37 @@ static void audio_playback_task(void *argument) {
     (void)argument;
     audio_playback_block_t block;
     while (true) {
-        if (xQueueReceive(audio_playback_queue, &block, portMAX_DELAY) != pdTRUE) {
+        if (xQueueReceive(
+                audio_playback_queue,
+                &block,
+                pdMS_TO_TICKS(AUDIO_IDLE_MUTE_MS)
+            ) != pdTRUE) {
+            if (audio_amplifier_enabled) {
+                // Mute the DAC before disabling the external amplifier. This
+                // prevents idle I2S data and clock changes from reaching the
+                // connected speaker.
+                esp_codec_dev_set_out_mute(audio_play_device, true);
+                esp_io_expander_set_level(expander, EXIO_NS_MODE, 0);
+                audio_amplifier_enabled = false;
+                ESP_LOGI(TAG, "SPEAKER MUTED idle=1");
+            }
             continue;
+        }
+        if (!audio_amplifier_enabled) {
+            // P7 is the NS4150 control line in Waveshare's exact-board audio
+            // example. Keep it low at rest and enable it only for real PCM.
+            if (esp_io_expander_set_level(expander, EXIO_NS_MODE, 1) != ESP_OK) {
+                ESP_LOGE(TAG, "SPEAKER amplifier enable failed");
+                continue;
+            }
+            vTaskDelay(pdMS_TO_TICKS(10));
+            if (esp_codec_dev_set_out_mute(audio_play_device, false) != ESP_CODEC_DEV_OK) {
+                esp_io_expander_set_level(expander, EXIO_NS_MODE, 0);
+                ESP_LOGE(TAG, "SPEAKER codec unmute failed");
+                continue;
+            }
+            audio_amplifier_enabled = true;
+            ESP_LOGI(TAG, "SPEAKER ENABLED pcm=1");
         }
         audio_output_busy = true;
         const int result = esp_codec_dev_write(
@@ -309,16 +341,26 @@ static esp_err_t init_expander(void) {
         "TCA9554"
     );
 
-    // P6 is the V2 battery/system power hold. Claim it before the display reset.
+    // P6 is the V2 battery/system power hold. P7 controls the NS4150 speaker
+    // path. Claim P7 here, but keep the amplifier off until PCM is queued.
     ESP_RETURN_ON_ERROR(
-        esp_io_expander_set_dir(expander, EXIO_SYSTEM_ENABLE, IO_EXPANDER_OUTPUT),
+        esp_io_expander_set_dir(
+            expander,
+            EXIO_SYSTEM_ENABLE | EXIO_NS_MODE,
+            IO_EXPANDER_OUTPUT
+        ),
         TAG,
-        "SYS_EN direction"
+        "SYS_EN/NS_MODE direction"
     );
     ESP_RETURN_ON_ERROR(
         esp_io_expander_set_level(expander, EXIO_SYSTEM_ENABLE, 1),
         TAG,
         "SYS_EN high"
+    );
+    ESP_RETURN_ON_ERROR(
+        esp_io_expander_set_level(expander, EXIO_NS_MODE, 0),
+        TAG,
+        "NS_MODE idle low"
     );
     ESP_RETURN_ON_ERROR(
         esp_io_expander_set_dir(
@@ -484,6 +526,12 @@ static esp_err_t init_audio_input(void) {
         ESP_FAIL,
         TAG,
         "ES8311 volume"
+    );
+    ESP_RETURN_ON_FALSE(
+        esp_codec_dev_set_out_mute(audio_play_device, true) == ESP_CODEC_DEV_OK,
+        ESP_FAIL,
+        TAG,
+        "ES8311 idle mute"
     );
     audio_output_open = true;
     audio_playback_queue = xQueueCreate(
@@ -934,7 +982,8 @@ int hmi_touch349_audio_pending(void) {
     if (audio_playback_queue == NULL) {
         return 0;
     }
-    return (int)uxQueueMessagesWaiting(audio_playback_queue) + (audio_output_busy ? 1 : 0);
+    return (int)uxQueueMessagesWaiting(audio_playback_queue) +
+        (audio_output_busy ? 1 : 0) + (audio_amplifier_enabled ? 1 : 0);
 }
 
 int hmi_touch349_audio_stop(uint32_t *dropped_samples) {
